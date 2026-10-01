@@ -258,6 +258,101 @@ def test_from_dict_rejects_unknown_missing_bad_timestamp_nan_and_cross_fields() 
         )
 
 
+def _empty_post_filter_profile() -> AccountProfile:
+    return AccountProfile(
+        schema_version="1.0",
+        account_id="account-empty",
+        game_ids=["game-before-filter"],
+        primary_game_id="game-before-filter",
+        primary_channel_id="channel-before-filter",
+        active_months_utc=[],
+        n_messages=0,
+        n_chars=0,
+        session_count=0,
+        activity_histogram_utc=[0] * 24,
+        utc_hour_filter=[4],
+        chunk_ids=[],
+        raw_stream_path="streams/empty.raw.ndjson",
+        normalized_stream_path="streams/empty.normalized.ndjson",
+        status="INSUFFICIENT_DATA",
+        minimum_messages=200,
+        minimum_chars=5000,
+        preprocessing_fingerprint=_DIGEST,
+    )
+
+
+def test_empty_post_filter_profile_validates_and_round_trips() -> None:
+    profile = _empty_post_filter_profile()
+    serialized = canonical_json(profile.to_dict())
+
+    restored = AccountProfile.from_dict(json.loads(serialized))
+
+    assert restored == profile
+    assert canonical_json(restored.to_dict()) == serialized
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"n_chars": 1},
+        {"session_count": 1},
+        {"chunk_ids": ["chunk-1"]},
+        {"active_months_utc": ["2026-01"]},
+    ],
+)
+def test_empty_post_filter_profile_rejects_each_nonempty_derived_value(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ContractValidationError):
+        AccountProfile.from_dict({**_empty_post_filter_profile().to_dict(), **changes})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"n_messages": 1, "n_chars": 0},
+        {"n_messages": 1, "session_count": 0},
+        {"n_messages": 1, "chunk_ids": []},
+        {"n_messages": 1, "active_months_utc": []},
+    ],
+)
+def test_nonempty_post_filter_profile_rejects_each_empty_derived_value(
+    changes: dict[str, object],
+) -> None:
+    profile = next(item for item in _samples() if isinstance(item, AccountProfile))
+    with pytest.raises(ContractValidationError):
+        AccountProfile.from_dict({**profile.to_dict(), **changes})
+
+
+def test_profile_status_must_match_minimums() -> None:
+    below_minimums = next(item for item in _samples() if isinstance(item, AccountProfile))
+    with pytest.raises(ContractValidationError):
+        AccountProfile.from_dict({**below_minimums.to_dict(), "status": "READY"})
+
+    ready = AccountProfile(
+        schema_version="1.0",
+        account_id="account-ready",
+        game_ids=["game-1"],
+        primary_game_id="game-1",
+        primary_channel_id=None,
+        active_months_utc=["2026-01"],
+        n_messages=2,
+        n_chars=10,
+        session_count=1,
+        activity_histogram_utc=[0] * 24,
+        utc_hour_filter=None,
+        chunk_ids=["chunk-1"],
+        raw_stream_path="streams/ready.raw.ndjson",
+        normalized_stream_path="streams/ready.normalized.ndjson",
+        status="READY",
+        minimum_messages=2,
+        minimum_chars=10,
+        preprocessing_fingerprint=_DIGEST,
+    )
+    with pytest.raises(ContractValidationError):
+        AccountProfile.from_dict({**ready.to_dict(), "status": "INSUFFICIENT_DATA"})
+
+
 def test_text_carrying_repr_and_errors_never_disclose_text() -> None:
     text_types = [
         item
