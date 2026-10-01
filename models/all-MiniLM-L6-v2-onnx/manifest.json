@@ -1,0 +1,13 @@
+{
+  "do_lower_case": true,
+  "embedding_dim": 384,
+  "license": "Apache-2.0",
+  "maximum_token_length": 256,
+  "model_files": {
+    "model.onnx": "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+  },
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "onnx_model": "model.onnx",
+  "tokenizer_vocab": "vocab.txt",
+  "tokenizer_vocab_sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+}
