@@ -1,8 +1,8 @@
 # AuthorshipAttribution
 
-Local data contracts and ingestion/preprocessing foundations for a moderator
-decision-support system. This repository's Phase 1 data modules do not score
-accounts.
+Local data contracts, ingestion/preprocessing, and semantic scoring foundations
+for a moderator decision-support system. Scoring outputs are review-support
+measurements and require human review.
 
 ## Data ingestion
 
@@ -65,3 +65,12 @@ post-filter counts, month/chunk lists, and zero-line stream files.
 
 No module makes network requests or accesses IP, geolocation, or timezone
 databases. Only the standard library and Phase 0 shared contracts are used.
+
+## Semantic engine
+
+The normalized-stream-only semantic engine, local ONNX model manifest format,
+device selection, cache behavior, external-provider gate, and stable failure
+codes are documented in [SEMANTIC.md](SEMANTIC.md). NumPy is the only required
+runtime dependency; ONNX Runtime CPU or GPU may be installed through the
+corresponding optional dependency extra. Models are never downloaded at
+runtime.
