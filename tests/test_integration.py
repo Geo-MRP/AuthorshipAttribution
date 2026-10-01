@@ -60,6 +60,16 @@ def test_report_has_permanent_banner_and_two_independent_results() -> None:
     assert "combined_score" not in encoded
 
 
+def test_compare_report_table_lines_have_equal_length() -> None:
+    report = ComparisonReport(
+        "1.0", "flagged", "suspect", _result("stylometry"), _result("semantic"),
+        ComparisonReport.BANNER,
+    )
+    rendered = render_compare_report(report, output_format="table")
+    table_lines = [line for line in rendered.splitlines() if line.startswith(("+", "|"))]
+    assert len({len(line) for line in table_lines}) == 1
+
+
 @pytest.mark.parametrize(("score", "expected"), [(-0.8, 0.0), (0.1, 75.0), (1.0, 100.0)])
 def test_contract_calibration_is_inclusive_for_ties_and_boundaries(score: float, expected: float) -> None:
     assert calibrate_cosine(score, _baseline()) == expected

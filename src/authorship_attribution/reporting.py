@@ -32,10 +32,7 @@ def render_compare_report(
     if output_format == "json":
         payload = canonical_json(report).decode("utf-8")
         return f"{report.banner}\n{payload}"
-    lines = [report.banner, f"Flagged account: {report.flagged_account_id} | Suspect account: {report.suspect_account_id}"]
-    lines.append("+----------------------+----------------------+----------------------+")
-    lines.append("| Field                | Semantic             | Stylometry           |")
-    lines.append("+----------------------+----------------------+----------------------+")
+    rows = [("Field", "Semantic", "Stylometry")]
     for label, field in (
         ("Raw cosine", "raw_cosine"),
         ("Known-different baseline percentile", "calibrated_percentile"),
@@ -46,12 +43,21 @@ def render_compare_report(
         if field in {"raw_cosine", "calibrated_percentile"}:
             semantic = _score(semantic)
             stylometry = _score(stylometry)
-        lines.append(f"| {label:<20} | {str(semantic):<20} | {str(stylometry):<20} |")
-    lines.append(f"| Candidate messages   | {report.semantic.n_messages['candidate']:<20} | {report.stylometry.n_messages['candidate']:<20} |")
-    lines.append(f"| Suspect messages     | {report.semantic.n_messages['suspect']:<20} | {report.stylometry.n_messages['suspect']:<20} |")
+        rows.append((label, str(semantic), str(stylometry)))
+    rows.append(("Candidate messages", str(report.semantic.n_messages["candidate"]), str(report.stylometry.n_messages["candidate"])))
+    rows.append(("Suspect messages", str(report.semantic.n_messages["suspect"]), str(report.stylometry.n_messages["suspect"])))
     if report.semantic.error is not None or report.stylometry.error is not None:
-        lines.append(f"| Sanitized error      | {str(report.semantic.error or '—'):<20} | {str(report.stylometry.error or '—'):<20} |")
-    lines.append("+----------------------+----------------------+----------------------+")
+        rows.append(("Sanitized error", str(report.semantic.error or "—"), str(report.stylometry.error or "—")))
+
+    widths = [max(len(row[column]) for row in rows) for column in range(3)]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    table_lines = [border]
+    table_lines.extend(
+        "| " + " | ".join(value.ljust(width) for value, width in zip(row, widths)) + " |"
+        for row in rows
+    )
+    table_lines.append(border)
+    lines = [report.banner, f"Flagged account: {report.flagged_account_id} | Suspect account: {report.suspect_account_id}", *table_lines]
     return "\n".join(lines)
 
 
