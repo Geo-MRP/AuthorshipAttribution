@@ -124,18 +124,34 @@ digest fields, and redacts `normalized_text` from repr.
 | --- | --- |
 | `schema_version` | Exactly `"1.0"`. |
 | `account_id` | Nonempty opaque ID. |
-| `game_ids` | Nonempty sorted, unique list of game IDs. |
-| `primary_game_id` | One of `game_ids`; chosen upstream by highest message count, then lexicographic tie break. |
-| `primary_channel_id` | Channel ID or `None`; chosen upstream by the same count/tie rule. |
-| `active_months_utc` | Sorted, unique `YYYY-MM` list derived from post-filter messages. |
-| `n_messages`, `n_chars`, `session_count` | Nonnegative integers. |
+| `game_ids` | Nonempty sorted, unique list of game IDs from accepted messages before the UTC-hour filter. |
+| `primary_game_id` | One of `game_ids`, from accepted messages before the UTC-hour filter; chosen upstream by highest message count, then lexicographic tie break. |
+| `primary_channel_id` | Channel ID or `None`, from accepted messages before the UTC-hour filter; chosen upstream by the same count/tie rule. |
+| `active_months_utc` | Sorted, unique `YYYY-MM` list from post-filter messages; may be empty. |
+| `n_messages`, `n_chars`, `session_count` | Nonnegative integers from post-filter messages; each may be 0. |
 | `activity_histogram_utc` | Exactly 24 nonnegative integers. |
 | `utc_hour_filter` | `None` or sorted, unique integers from 0 through 23. |
-| `chunk_ids` | List of nonempty chunk IDs. |
-| `raw_stream_path`, `normalized_stream_path` | Nonempty stream path strings. |
-| `status` | `READY` or `INSUFFICIENT_DATA`. |
+| `chunk_ids` | List of nonempty chunk IDs from post-filter messages; may be empty. |
+| `raw_stream_path`, `normalized_stream_path` | Nonempty stream path strings. Zero-line raw and normalized stream files are valid, and an empty post-filter profile still points to them. |
+| `status` | `READY` exactly when both profile minimums are met; otherwise `INSUFFICIENT_DATA`. |
 | `minimum_messages`, `minimum_chars` | Applied minimum thresholds. |
 | `preprocessing_fingerprint` | SHA-256 preprocessing fingerprint. |
+
+`game_ids`, `primary_game_id`, and `primary_channel_id` describe accepted
+messages before the UTC-hour filter. `n_messages`, `n_chars`,
+`session_count`, `chunk_ids`, and `active_months_utc` describe post-filter
+messages. A profile can therefore retain nonempty game identity while having
+no post-filter messages.
+
+`n_messages == 0` if and only if `n_chars == 0`, `session_count == 0`,
+`chunk_ids == []`, and `active_months_utc == []`. When `n_messages` is
+positive, all four corresponding post-filter values are nonempty/nonzero.
+`status` is `READY` if and only if both `n_messages >= minimum_messages` and
+`n_chars >= minimum_chars`; otherwise it is `INSUFFICIENT_DATA`.
+
+An account with no accepted messages at all gets no `AccountProfile`:
+`build_account_profiles` omits it, and callers may report only the count of
+omitted accounts.
 
 ### Pair and Engine Records
 

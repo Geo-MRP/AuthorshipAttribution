@@ -635,9 +635,9 @@ class AccountProfile(_Contract):
             _require_month(month, "active_months_utc")
         if months != sorted(set(months)):
             _invalid("active_months_utc")
-        _require_int(self.n_messages, "n_messages", minimum=0)
-        _require_int(self.n_chars, "n_chars", minimum=0)
-        _require_int(self.session_count, "session_count", minimum=0)
+        n_messages = _require_int(self.n_messages, "n_messages", minimum=0)
+        n_chars = _require_int(self.n_chars, "n_chars", minimum=0)
+        session_count = _require_int(self.session_count, "session_count", minimum=0)
         histogram = _require_list(
             self.activity_histogram_utc, "activity_histogram_utc"
         )
@@ -646,19 +646,43 @@ class AccountProfile(_Contract):
         for value in histogram:
             _require_int(value, "activity_histogram_utc", minimum=0)
         _require_hour_list(self.utc_hour_filter, "utc_hour_filter")
-        _require_string_list(self.chunk_ids, "chunk_ids", nonempty_items=True)
+        chunk_ids = _require_string_list(
+            self.chunk_ids, "chunk_ids", nonempty_items=True
+        )
         _require_str(self.raw_stream_path, "raw_stream_path", nonempty=True)
         _require_str(
             self.normalized_stream_path, "normalized_stream_path", nonempty=True
         )
-        _require_literal(
+        status = _require_literal(
             self.status,
             "status",
             frozenset(("READY", "INSUFFICIENT_DATA")),
         )
-        _require_int(self.minimum_messages, "minimum_messages", minimum=0)
-        _require_int(self.minimum_chars, "minimum_chars", minimum=0)
+        minimum_messages = _require_int(
+            self.minimum_messages, "minimum_messages", minimum=0
+        )
+        minimum_chars = _require_int(self.minimum_chars, "minimum_chars", minimum=0)
         _require_sha256(self.preprocessing_fingerprint, "preprocessing_fingerprint")
+        if n_messages == 0:
+            if (
+                n_chars != 0
+                or session_count != 0
+                or chunk_ids != []
+                or months != []
+            ):
+                _invalid("n_messages")
+        elif (
+            n_chars == 0
+            or session_count == 0
+            or chunk_ids == []
+            or months == []
+        ):
+            _invalid("n_messages")
+        meets_minimums = (
+            n_messages >= minimum_messages and n_chars >= minimum_chars
+        )
+        if (status == "READY") != meets_minimums:
+            _invalid("status")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> Self:
