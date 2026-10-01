@@ -74,3 +74,11 @@ codes are documented in [SEMANTIC.md](SEMANTIC.md). NumPy is the only required
 runtime dependency; ONNX Runtime CPU or GPU may be installed through the
 corresponding optional dependency extra. Models are never downloaded at
 runtime.
+
+## Integration CLI
+
+The `authorship-attribution` commands provide `ingest`, `compare`,
+`build-baseline`, and `evaluate` workflows. See [INTEGRATION.md](INTEGRATION.md)
+for baseline refresh cadence, evaluation threshold selection, timeout and
+partial-failure behavior, privacy, and limits on use. Comparisons are
+moderator decision support only and require human review.
