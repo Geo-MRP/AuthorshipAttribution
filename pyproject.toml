@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authorship_attribution"
+version = "0.1.0"
+description = "Shared contracts for authorship-attribution moderation decision support"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+cpu = ["onnxruntime==1.20.1"]
+cuda = ["onnxruntime-gpu==1.20.1"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

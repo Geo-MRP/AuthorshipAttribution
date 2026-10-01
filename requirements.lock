@@ -1,0 +1,21 @@
+# Approved dependency allowlist. Install exactly one ONNX Runtime provider.
+
+# Test tooling
+pytest==8.3.3
+iniconfig==2.0.0
+pluggy==1.5.0
+packaging==24.2
+
+# Later-agent runtime dependencies
+numpy==2.1.3
+onnxruntime==1.20.1
+coloredlogs==15.0.1
+humanfriendly==10.0
+flatbuffers==24.3.25
+protobuf==5.28.3
+sympy==1.13.3
+mpmath==1.3.0
+typing_extensions==4.12.2
+
+# The CPU provider above is selected for this lock file. For CUDA deployments,
+# replace it with onnxruntime-gpu==1.20.1; never install both providers.
