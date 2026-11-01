@@ -14,6 +14,8 @@ from .contracts import (
     AccountProfile,
     BaselineConfig,
     BaselineDistribution,
+    ChronobiologyArtifact,
+    ChronobiologyConfig,
     EmbeddingModel,
     LabeledPair,
     RawStreamChunk,
@@ -22,10 +24,11 @@ from .contracts import (
     StylometryConfig,
 )
 from .errors import ContractValidationError, ErrorCode
+from .chronobiology import compute_chronobiology_raw
 from .fileformats import read_json_artifact, write_json_artifact
-from .fingerprints import canonical_json, semantic_fingerprint, sha256_hex
+from .fingerprints import canonical_json, chronobiology_fingerprint, semantic_fingerprint, sha256_hex
 from .semantic import compute_semantic_raw
-from .streams import load_normalized_stream, load_raw_stream
+from .streams import load_normalized_stream, load_raw_stream, load_temporal_stream
 from .stylometry import compute_stylometry_raw
 
 LOGGER = logging.getLogger(__name__)
@@ -126,13 +129,24 @@ def build_baselines(
     *,
     stylometry_artifact: StylometryArtifact,
     semantic_model: EmbeddingModel,
+    chronobiology_artifact: ChronobiologyArtifact,
     config: BaselineConfig,
     seed: int,
     output_dir: Path,
-) -> Mapping[Literal["stylometry", "semantic"], BaselineDistribution]:
-    """Build per-engine empirical baselines from reviewed different-label pairs."""
+) -> Mapping[Literal["stylometry", "semantic", "chronobiology"], BaselineDistribution]:
+    """Build three immutable known-different empirical baselines."""
     if not isinstance(config, BaselineConfig) or not isinstance(output_dir, Path):
         raise ContractValidationError("input", ErrorCode.INPUT_INVALID)
+    if not isinstance(stylometry_artifact, StylometryArtifact):
+        raise ContractValidationError("stylometry_artifact", ErrorCode.INPUT_INVALID)
+    if not isinstance(chronobiology_artifact, ChronobiologyArtifact):
+        raise ContractValidationError("chronobiology_artifact", ErrorCode.INPUT_INVALID)
+    config._validate()
+    stylometry_artifact._validate()
+    chronobiology_artifact._validate()
+    if type(seed) is not int:
+        raise ContractValidationError("seed", ErrorCode.INPUT_INVALID)
+
     eligible = _eligible_pairs(training_pairs, profiles, config)
     required = max(1000, config.min_pairs)
     if len(eligible) < required:
@@ -140,69 +154,131 @@ def build_baselines(
     sampled = _sample_stratified(eligible, config.max_pairs, seed)
     if len(sampled) < required:
         raise ContractValidationError("known_different_pairs", ErrorCode.MINIMUMS_NOT_MET)
-    min_messages = max(profiles[p.account_id_a].minimum_messages for p, _ in sampled)
-    min_messages = max(min_messages, max(profiles[p.account_id_b].minimum_messages for p, _ in sampled))
-    min_chars = max(profiles[p.account_id_a].minimum_chars for p, _ in sampled)
-    min_chars = max(min_chars, max(profiles[p.account_id_b].minimum_chars for p, _ in sampled))
-    artifact_payload = read_json_artifact(Path(stylometry_artifact.payload_path))
-    preprocessing_fps = {profiles[pair.account_id_a].preprocessing_fingerprint for pair, _ in sampled}
-    preprocessing_fps.update(profiles[pair.account_id_b].preprocessing_fingerprint for pair, _ in sampled)
+
+    selected_profiles = [
+        profiles[account_id]
+        for pair, _ in sampled
+        for account_id in (pair.account_id_a, pair.account_id_b)
+    ]
+    min_messages = max(profile.minimum_messages for profile in selected_profiles)
+    min_chars = max(profile.minimum_chars for profile in selected_profiles)
+    if any(
+        profile.status != "READY"
+        or profile.n_messages < min_messages
+        or profile.n_chars < min_chars
+        for profile in selected_profiles
+    ):
+        raise ContractValidationError("known_different_pairs", ErrorCode.MINIMUMS_NOT_MET)
+    preprocessing_fps = {profile.preprocessing_fingerprint for profile in selected_profiles}
     if len(preprocessing_fps) != 1:
         raise ContractValidationError("preprocessing_fingerprint", ErrorCode.BASELINE_CONFIG_MISMATCH)
+    preprocessing_fp = next(iter(preprocessing_fps))
+
+    stylometry_payload = read_json_artifact(Path(stylometry_artifact.payload_path))
+    chrono_payload = read_json_artifact(Path(chronobiology_artifact.payload_path))
+    if chrono_payload.get("preprocessing_fingerprint") != preprocessing_fp:
+        raise ContractValidationError("preprocessing_fingerprint", ErrorCode.BASELINE_CONFIG_MISMATCH)
+    weights = chrono_payload.get("block_weights")
+    if type(weights) is not dict:
+        raise ContractValidationError("artifact", ErrorCode.ARTIFACT_INVALID)
+    try:
+        chrono_config = ChronobiologyConfig(
+            feature_spec_version=chronobiology_artifact.feature_spec_version,
+            block_weights=weights,
+            minimum_messages=min_messages,
+            minimum_chars=min_chars,
+        )
+    except ContractValidationError:
+        raise ContractValidationError("artifact", ErrorCode.ARTIFACT_INVALID) from None
+    if chronobiology_fingerprint(
+        chrono_config, chronobiology_artifact.artifact_sha256, preprocessing_fp
+    ) != chronobiology_artifact.configuration_fingerprint:
+        raise ContractValidationError("configuration", ErrorCode.BASELINE_CONFIG_MISMATCH)
+
     stylo_config = StylometryConfig(
         feature_spec_version=stylometry_artifact.feature_spec_version,
         hash_space_size=stylometry_artifact.hash_space_size,
-        ngram_min=int(artifact_payload.get("ngram_min", 2)),
-        ngram_max=int(artifact_payload.get("ngram_max", 4)),
-        minimum_messages=min_messages, minimum_chars=min_chars,
+        ngram_min=int(stylometry_payload.get("ngram_min", 2)),
+        ngram_max=int(stylometry_payload.get("ngram_max", 4)),
+        minimum_messages=min_messages,
+        minimum_chars=min_chars,
     )
     semantic_config = SemanticConfig(
-        model_dir=Path("."), cache_dir=output_dir / "cache", center_embeddings=False,
-        minimum_messages=min_messages, minimum_chars=min_chars,
+        model_dir=Path("."),
+        cache_dir=output_dir / "cache",
+        center_embeddings=False,
+        minimum_messages=min_messages,
+        minimum_chars=min_chars,
     )
     semantic_fp = semantic_fingerprint(
-        semantic_config, semantic_model.model_fingerprint,
+        semantic_config,
+        semantic_model.model_fingerprint,
         getattr(semantic_model, "tokenizer_sha256", semantic_model.model_fingerprint),
-        next(iter(preprocessing_fps)),
+        preprocessing_fp,
     )
     stylo_scores: list[float] = []
     semantic_scores: list[float] = []
+    chrono_scores: list[float] = []
     chosen_pairs: list[LabeledPair] = []
     chosen_strata: list[str] = []
     for pair, stratum in sampled:
         left, right = profiles[pair.account_id_a], profiles[pair.account_id_b]
-        stylo_scores.append(compute_stylometry_raw(
-            load_raw_stream(left), load_raw_stream(right), artifact=stylometry_artifact, config=stylo_config
-        ))
-        semantic_scores.append(compute_semantic_raw(
-            load_normalized_stream(left), load_normalized_stream(right), model=semantic_model, config=semantic_config
-        ))
+        stylo_scores.append(
+            compute_stylometry_raw(
+                load_raw_stream(left), load_raw_stream(right),
+                artifact=stylometry_artifact, config=stylo_config,
+            )
+        )
+        semantic_scores.append(
+            compute_semantic_raw(
+                load_normalized_stream(left), load_normalized_stream(right),
+                model=semantic_model, config=semantic_config,
+            )
+        )
+        chrono_scores.append(
+            compute_chronobiology_raw(
+                load_temporal_stream(left), load_temporal_stream(right),
+                artifact=chronobiology_artifact, config=chrono_config,
+            )
+        )
         chosen_pairs.append(pair)
         chosen_strata.append(stratum)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stylometry = _baseline("stylometry", stylo_scores, chosen_pairs, chosen_strata,
-                           stylometry_artifact.configuration_fingerprint, seed, min_messages, min_chars)
-    semantic = _baseline("semantic", semantic_scores, chosen_pairs, chosen_strata,
-                         semantic_fp, seed, min_messages, min_chars)
-    for artifact in (stylometry, semantic):
-        path = output_dir / f"{artifact.engine}-{artifact.baseline_id.rsplit('-', 1)[-1]}.json"
-        # Baseline outputs are immutable: never replace an existing baseline.
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ContractValidationError("output_dir", ErrorCode.ARTIFACT_INVALID) from None
+    candidates = (
+        _baseline(
+            "stylometry", stylo_scores, chosen_pairs, chosen_strata,
+            stylometry_artifact.configuration_fingerprint, seed, min_messages, min_chars,
+        ),
+        _baseline(
+            "semantic", semantic_scores, chosen_pairs, chosen_strata,
+            semantic_fp, seed, min_messages, min_chars,
+        ),
+        _baseline(
+            "chronobiology", chrono_scores, chosen_pairs, chosen_strata,
+            chronobiology_artifact.configuration_fingerprint, seed, min_messages, min_chars,
+        ),
+    )
+    built: dict[str, BaselineDistribution] = {}
+    for baseline in candidates:
+        path = output_dir / f"{baseline.engine}-{baseline.baseline_id.rsplit('-', 1)[-1]}.json"
         if path.exists():
             existing = BaselineDistribution.from_dict(read_json_artifact(path))
             existing_data = existing.to_dict()
-            candidate_data = artifact.to_dict()
+            candidate_data = baseline.to_dict()
             existing_data.pop("created_at_utc")
             candidate_data.pop("created_at_utc")
             if existing_data != candidate_data:
                 raise ContractValidationError("baseline_path", ErrorCode.ARTIFACT_INVALID)
-            if artifact.engine == "stylometry":
-                stylometry = existing
-            else:
-                semantic = existing
+            baseline = existing
         else:
-            write_json_artifact(artifact, path)
-    LOGGER.info("baseline_built engines=2 pairs=%d seed=%d", len(chosen_pairs), seed)
-    return {"stylometry": stylometry, "semantic": semantic}
+            write_json_artifact(baseline, path)
+        built[baseline.engine] = baseline
+    LOGGER.info("baseline_built engines=3 pairs=%d seed=%d", len(chosen_pairs), seed)
+    return built
 
 
 def baseline_needs_refresh(

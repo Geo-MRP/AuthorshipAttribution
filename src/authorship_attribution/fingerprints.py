@@ -9,7 +9,14 @@ import json
 import math
 from pathlib import Path
 
-from .contracts import PreprocessConfig, SemanticConfig, StylometryConfig
+from .contracts import (
+    ChronobiologyConfig,
+    PreprocessConfig,
+    SemanticConfig,
+    StylometryConfig,
+    _require_sha256,
+)
+from .errors import ContractValidationError, ErrorCode
 
 
 NORMALIZATION_SPEC_VERSION = "1.0"
@@ -86,6 +93,7 @@ def preprocessing_fingerprint(
     return fingerprint(
         {
             "normalization_spec_version": NORMALIZATION_SPEC_VERSION,
+            "message_order_spec_version": "2.0",
             "idle_gap_minutes": config.idle_gap_minutes,
             "utc_hour_filter": config.utc_hour_filter,
             "chunk_target_mode": config.chunk_target_mode,
@@ -142,6 +150,28 @@ def semantic_fingerprint(
             "minimum_chars": config.minimum_chars,
             "model_manifest_sha256": model_manifest_sha256,
             "tokenizer_sha256": tokenizer_sha256,
+            "preprocessing_fingerprint": preprocessing_fp,
+        }
+    )
+
+
+def chronobiology_fingerprint(
+    config: ChronobiologyConfig,
+    artifact_sha256: str,
+    preprocessing_fp: str,
+) -> str:
+    if not isinstance(config, ChronobiologyConfig):
+        raise ContractValidationError("config", ErrorCode.INPUT_INVALID)
+    config._validate()
+    _require_sha256(artifact_sha256, "artifact_sha256")
+    _require_sha256(preprocessing_fp, "preprocessing_fingerprint")
+    return fingerprint(
+        {
+            "feature_spec_version": config.feature_spec_version,
+            "block_weights": config.block_weights,
+            "minimum_messages": config.minimum_messages,
+            "minimum_chars": config.minimum_chars,
+            "artifact_sha256": artifact_sha256,
             "preprocessing_fingerprint": preprocessing_fp,
         }
     )

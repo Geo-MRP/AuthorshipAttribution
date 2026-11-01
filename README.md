@@ -31,13 +31,16 @@ set `chunk_target_mode="messages"` and `chunk_target_value` (for example, 50).
 Chunking never splits messages or crosses sessions. A gap exactly equal to the
 idle-gap limit starts a new session.
 
-Input messages are sorted by UTC timestamp and message ID. Empty and system
-messages are excluded; whitespace-only messages remain. The UTC activity
-histogram is computed from accepted messages before the optional hour filter.
-Account counts, sessions, active months, and chunks describe post-filter data.
-Normalization uses Unicode NFC, username and @handle masking, URL masking,
-numeric masking, game-term masking, whitespace collapse, and trim, in that
-order. The original text is kept only in the raw stream.
+Input messages are sorted by UTC timestamp, message ID, then game ID, making
+same-ID messages from different games deterministic. This ordering change
+updates the preprocessing fingerprint; regenerate references built under the
+old preprocessing behavior. Empty and system messages are excluded;
+whitespace-only messages remain. The UTC activity histogram is computed from
+accepted messages before the optional hour filter. Filtering and minimum-count
+checks use post-filter messages, as do account counts, sessions, active months,
+and chunks. Normalization uses Unicode NFC, username and @handle masking, URL
+masking, numeric masking, game-term masking, whitespace collapse, and trim, in
+that order. The original text is kept only in the raw stream.
 
 ## Artifacts and retention
 
@@ -48,23 +51,41 @@ under:
 * `OUT/raw/<sha256-account-id>.ndjson` — raw-only `RawStreamChunk` records.
 * `OUT/normalized/<sha256-account-id>.ndjson` — normalized-only
   `NormalizedStreamChunk` records.
+* `OUT/temporal/<sha256-account-id>.ndjson` — content-free
+  `TemporalStreamChunk` records with exactly `schema_version`, `chunk_id`,
+  `account_id`, `session_id`, `timestamps_utc`, `char_counts`, `n_messages`,
+  and `n_chars`. There is one temporal record per raw/normalized chunk;
+  timestamp and character-count arrays align with that chunk's messages.
+  Character counts are Python Unicode code-point lengths. Chunks from the same
+  session repeat the same `session_id`, so a chunk boundary is not a session
+  boundary. Timestamps and lengths are sensitive behavioral metadata and need
+  the same retention protections as the other streams.
 
-Stream profile paths are absolute local paths. Each artifact is UTF-8; profile
+Stream profile paths are absolute local paths. Artifacts use UTF-8; profile
 JSON is a single canonical object and each NDJSON line is a single canonical
 object. `load_raw_stream` and `load_normalized_stream` validate projections
-and ensure account/chunk ordering matches the profile. Runs remove expired
-stream files based on configured retention. A retention of zero schedules the
-generated raw and normalized files for deletion when the Python process exits;
-the profile metadata remains available.
+and ensure account/chunk ordering matches the profile. `load_temporal_stream`
+validates account and chunk identity, profile message and character totals,
+session continuity/count, and chronological ordering across records without
+opening either text-bearing stream. Each stream file is atomically replaced
+individually; writing the raw, normalized, and temporal files is not a
+multi-file transaction. Runs remove expired raw, normalized, and temporal
+stream files based on configured retention. A retention of zero schedules all
+three generated streams for deletion when the Python process exits; the profile
+metadata remains available. A zero-retention CLI ingest therefore deletes its
+generated streams at process exit, so later CLI processes cannot use them.
 
 Accounts with no accepted non-system, non-empty messages are omitted and the
 omitted account count is logged without message content. Accounts with accepted
 messages but none remaining after UTC-hour filtering retain their pre-filter
 game/channel metadata and receive an `INSUFFICIENT_DATA` profile with empty
-post-filter counts, month/chunk lists, and zero-line stream files.
+post-filter counts, month/chunk lists, and three zero-line stream files.
 
-No module makes network requests or accesses IP, geolocation, or timezone
-databases. Only the standard library and Phase 0 shared contracts are used.
+Preprocessing and temporal readers make no network calls and do not access IP,
+geolocation, or timezone databases. Existing semantic inference may use the
+approved pinned ONNX Runtime offline. The external semantic adapter remains
+explicitly opt-in and network-capable, and `setup_minilm_onnx.py` remains a
+manual network-capable helper.
 
 ## Semantic engine
 

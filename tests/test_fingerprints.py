@@ -4,9 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from authorship_attribution.contracts import PreprocessConfig, SemanticConfig, StylometryConfig
+from authorship_attribution.contracts import (
+    ChronobiologyConfig,
+    PreprocessConfig,
+    SemanticConfig,
+    StylometryConfig,
+)
+from authorship_attribution.errors import ContractValidationError, ErrorCode
 from authorship_attribution.fingerprints import (
     canonical_json,
+    chronobiology_fingerprint,
     fingerprint,
     preprocessing_fingerprint,
     semantic_fingerprint,
@@ -43,6 +50,20 @@ def test_preprocessing_fingerprint_includes_behavior_excludes_cache_retention() 
     assert initial != preprocessing_fingerprint(behavior_changed, _DIGEST_A, _DIGEST_B)
     assert initial != preprocessing_fingerprint(stable, _DIGEST_B, _DIGEST_B)
 
+    expected_components = {
+        "normalization_spec_version": "1.0",
+        "message_order_spec_version": "2.0",
+        "idle_gap_minutes": stable.idle_gap_minutes,
+        "utc_hour_filter": stable.utc_hour_filter,
+        "chunk_target_mode": stable.chunk_target_mode,
+        "chunk_target_value": stable.chunk_target_value,
+        "minimum_messages": stable.minimum_messages,
+        "minimum_chars": stable.minimum_chars,
+        "game_terms_sha256": _DIGEST_A,
+        "usernames_sha256": _DIGEST_B,
+    }
+    assert initial == fingerprint(expected_components)
+
 
 def test_stylometry_fingerprint_changes_with_included_components() -> None:
     config = StylometryConfig()
@@ -75,3 +96,56 @@ def test_semantic_fingerprint_excludes_hardware_and_cache_settings() -> None:
     initial = semantic_fingerprint(base, _DIGEST_A, _DIGEST_B, _DIGEST_A)
     assert initial == semantic_fingerprint(excluded_changed, _DIGEST_A, _DIGEST_B, _DIGEST_A)
     assert initial != semantic_fingerprint(included_changed, _DIGEST_A, _DIGEST_B, _DIGEST_A)
+
+
+def test_chronobiology_fingerprint_includes_all_behavior_and_asset_inputs() -> None:
+    config = ChronobiologyConfig()
+    initial = chronobiology_fingerprint(config, _DIGEST_A, _DIGEST_B)
+
+    reordered = ChronobiologyConfig(
+        block_weights={
+            "session_kinematics": 0.25,
+            "burst_process": 0.30,
+            "circadian_fourier": 0.45,
+        }
+    )
+    assert initial == chronobiology_fingerprint(reordered, _DIGEST_A, _DIGEST_B)
+    assert len(initial) == 64
+    assert initial == initial.lower()
+
+    alternatives = [
+        ChronobiologyConfig(feature_spec_version="2.0"),
+        ChronobiologyConfig(
+            block_weights={
+                "circadian_fourier": 0.4,
+                "burst_process": 0.35,
+                "session_kinematics": 0.25,
+            }
+        ),
+        ChronobiologyConfig(minimum_messages=201),
+        ChronobiologyConfig(minimum_chars=5001),
+    ]
+    for changed_config in alternatives:
+        assert chronobiology_fingerprint(changed_config, _DIGEST_A, _DIGEST_B) != initial
+    assert chronobiology_fingerprint(config, _DIGEST_B, _DIGEST_B) != initial
+    assert chronobiology_fingerprint(config, _DIGEST_A, _DIGEST_A) != initial
+
+
+def test_chronobiology_fingerprint_rejects_bad_inputs_without_echoing_values() -> None:
+    with pytest.raises(ContractValidationError) as invalid_config:
+        chronobiology_fingerprint(object(), _DIGEST_A, _DIGEST_B)  # type: ignore[arg-type]
+    assert invalid_config.value.code is ErrorCode.INPUT_INVALID
+    assert str(invalid_config.value) == "config:INPUT_INVALID"
+
+    marker = "synthetic-private-digest-marker"
+    with pytest.raises(ContractValidationError) as invalid_artifact:
+        chronobiology_fingerprint(ChronobiologyConfig(), marker, _DIGEST_B)
+    assert invalid_artifact.value.code is ErrorCode.INPUT_INVALID
+    assert str(invalid_artifact.value) == "artifact_sha256:INPUT_INVALID"
+    assert marker not in str(invalid_artifact.value)
+
+    with pytest.raises(ContractValidationError) as invalid_preprocessing:
+        chronobiology_fingerprint(ChronobiologyConfig(), _DIGEST_A, marker)
+    assert invalid_preprocessing.value.code is ErrorCode.INPUT_INVALID
+    assert str(invalid_preprocessing.value) == "preprocessing_fingerprint:INPUT_INVALID"
+    assert marker not in str(invalid_preprocessing.value)

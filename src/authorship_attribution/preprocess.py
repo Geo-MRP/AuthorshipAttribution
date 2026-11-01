@@ -19,6 +19,7 @@ from .contracts import (
     Chunk,
     Message,
     PreprocessConfig,
+    TemporalStreamChunk,
     message_key,
 )
 from .errors import ContractValidationError, ErrorCode
@@ -122,13 +123,16 @@ def _atomic_id(kind: str, components: object) -> str:
     return f"{kind}-{sha256_hex(canonical_json(components))}"
 
 
-def _stream_paths(output_dir: Path, account_id: str) -> tuple[Path, Path, Path]:
+def _stream_paths(
+    output_dir: Path, account_id: str
+) -> tuple[Path, Path, Path, Path]:
     account_key = sha256_hex(account_id.encode("utf-8"))
     root = output_dir.resolve()
     return (
         root / "profiles" / f"{account_key}.json",
         root / "raw" / f"{account_key}.ndjson",
         root / "normalized" / f"{account_key}.ndjson",
+        root / "temporal" / f"{account_key}.ndjson",
     )
 
 
@@ -136,7 +140,7 @@ def _expire_old_streams(output_dir: Path, retention_days: int) -> None:
     if retention_days == 0:
         return
     cutoff = time.time() - timedelta(days=retention_days).total_seconds()
-    for folder_name in ("raw", "normalized"):
+    for folder_name in ("raw", "normalized", "temporal"):
         folder = output_dir / folder_name
         if not folder.is_dir():
             continue
@@ -232,7 +236,11 @@ def build_account_profiles(
                 for message in source_by_account[account_id]
                 if not message.is_system and len(message.text) > 0
             ),
-            key=lambda item: (_timestamp(item.timestamp_utc), item.message_id),
+            key=lambda item: (
+                _timestamp(item.timestamp_utc),
+                item.message_id,
+                item.game_id,
+            ),
         )
         if not pre_filter:
             omitted_accounts += 1
@@ -260,6 +268,7 @@ def build_account_profiles(
                 sessions.append([message])
 
         chunks: list[Chunk] = []
+        temporal_records: list[TemporalStreamChunk] = []
         for session_index, session in enumerate(sessions):
             session_id = _atomic_id(
                 "session",
@@ -299,6 +308,18 @@ def build_account_profiles(
                         normalized_sha256=sha256_hex(normalized_text.encode("utf-8")),
                     )
                 )
+                temporal_records.append(
+                    TemporalStreamChunk(
+                        schema_version="1.0",
+                        chunk_id=chunk_id,
+                        account_id=account_id,
+                        session_id=session_id,
+                        timestamps_utc=[item.timestamp_utc for item in current],
+                        char_counts=[len(text) for text in raw_text],
+                        n_messages=len(current),
+                        n_chars=sum(len(text) for text in raw_text),
+                    )
+                )
                 current = []
                 current_chars = 0
 
@@ -322,13 +343,17 @@ def build_account_profiles(
 
         raw_records = [chunk.to_raw_stream_chunk() for chunk in chunks]
         normalized_records = [chunk.to_normalized_stream_chunk() for chunk in chunks]
-        profile_path, raw_path, normalized_path = _stream_paths(output_dir, account_id)
+        profile_path, raw_path, normalized_path, temporal_path = _stream_paths(
+            output_dir, account_id
+        )
         _REGISTERED_CLEANUP.discard(raw_path)
         _REGISTERED_CLEANUP.discard(normalized_path)
+        _REGISTERED_CLEANUP.discard(temporal_path)
         _write_ndjson(raw_path, raw_records)
         _write_ndjson(normalized_path, normalized_records)
+        _write_ndjson(temporal_path, temporal_records)
         if config.cache_retention_days == 0:
-            _REGISTERED_CLEANUP.update((raw_path, normalized_path))
+            _REGISTERED_CLEANUP.update((raw_path, normalized_path, temporal_path))
             atexit.unregister(_cleanup_at_exit)
             atexit.register(_cleanup_at_exit)
 
@@ -377,6 +402,7 @@ def build_account_profiles(
             minimum_messages=config.minimum_messages,
             minimum_chars=config.minimum_chars,
             preprocessing_fingerprint=preprocess_fp,
+            temporal_stream_path=str(temporal_path),
         )
         try:
             profile_path.parent.mkdir(parents=True, exist_ok=True)

@@ -29,7 +29,9 @@ _TIMESTAMP_RE = re.compile(
 )
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_ENGINE_NAMES = frozenset(("stylometry", "semantic"))
+_ENGINE_NAMES = frozenset(("stylometry", "semantic", "chronobiology"))
+_COMBINED_ENGINE_ORDER = ("stylometry", "semantic", "chronobiology")
+_EVALUATION_NAMES = frozenset((*_COMBINED_ENGINE_ORDER, "combined"))
 
 
 def _invalid(field_name: str) -> None:
@@ -322,6 +324,194 @@ class _Contract:
         return {item.name: _serialize(getattr(self, item.name)) for item in fields(self)}
 
 
+@dataclass(frozen=True, slots=True)
+class TemporalStreamChunk(_Contract):
+    schema_version: Literal["1.0"]
+    chunk_id: str
+    account_id: str
+    session_id: str
+    timestamps_utc: list[str]
+    char_counts: list[int]
+    n_messages: int
+    n_chars: int
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        _require_schema_version(self.schema_version)
+        _require_str(self.chunk_id, "chunk_id", nonempty=True)
+        _require_str(self.account_id, "account_id", nonempty=True)
+        _require_str(self.session_id, "session_id", nonempty=True)
+        timestamps = _require_string_list(
+            self.timestamps_utc, "timestamps_utc", nonempty_items=True
+        )
+        epochs: list[float] = []
+        for timestamp in timestamps:
+            _require_timestamp(timestamp, "timestamps_utc")
+            try:
+                epoch = datetime.fromisoformat(
+                    f"{timestamp[:-1]}+00:00"
+                ).timestamp()
+            except (OSError, OverflowError, ValueError):
+                _invalid("timestamps_utc")
+            if not math.isfinite(epoch):
+                _invalid("timestamps_utc")
+            epochs.append(epoch)
+        if any(left > right for left, right in zip(epochs, epochs[1:])):
+            _invalid("timestamps_utc")
+        char_counts = [
+            _require_int(value, "char_counts", minimum=0)
+            for value in _require_list(self.char_counts, "char_counts")
+        ]
+        n_messages = _require_int(self.n_messages, "n_messages", minimum=1)
+        n_chars = _require_int(self.n_chars, "n_chars", minimum=0)
+        if len(timestamps) != n_messages or len(char_counts) != n_messages:
+            _invalid("n_messages")
+        if sum(char_counts) != n_chars:
+            _invalid("n_chars")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        values = _checked_data(data, cls)
+        return cls(**dict(values))
+
+
+@dataclass(frozen=True, slots=True)
+class ChronobiologyConfig(_Contract):
+    feature_spec_version: str = "1.0"
+    block_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "circadian_fourier": 0.45,
+            "burst_process": 0.30,
+            "session_kinematics": 0.25,
+        }
+    )
+    minimum_messages: int = 200
+    minimum_chars: int = 5000
+
+    _BLOCK_NAMES: ClassVar[frozenset[str]] = frozenset(
+        ("circadian_fourier", "burst_process", "session_kinematics")
+    )
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        _require_str(self.feature_spec_version, "feature_spec_version", nonempty=True)
+        weights = _require_dict(self.block_weights, "block_weights")
+        if set(weights) != self._BLOCK_NAMES:
+            _invalid("block_weights")
+        values = [
+            _require_float(weights[name], "block_weights", minimum=0.0, maximum=1.0)
+            for name in sorted(self._BLOCK_NAMES)
+        ]
+        if not math.isclose(math.fsum(values), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            _invalid("block_weights")
+        _require_int(self.minimum_messages, "minimum_messages", minimum=1)
+        _require_int(self.minimum_chars, "minimum_chars", minimum=1)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        values = _checked_data(data, cls)
+        return cls(**dict(values))
+
+
+@dataclass(frozen=True, slots=True)
+class ChronobiologyArtifact(_Contract):
+    artifact_id: str
+    artifact_sha256: str
+    feature_spec_version: str
+    feature_means: list[float]
+    feature_stds: list[float]
+    payload_path: str
+    configuration_fingerprint: str
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        _require_str(self.artifact_id, "artifact_id", nonempty=True)
+        _require_sha256(self.artifact_sha256, "artifact_sha256")
+        _require_str(self.feature_spec_version, "feature_spec_version", nonempty=True)
+        means = _require_float_list(self.feature_means, "feature_means")
+        stds = _require_float_list(self.feature_stds, "feature_stds", minimum=0.0)
+        if len(means) != 122:
+            _invalid("feature_means")
+        if len(stds) != 122:
+            _invalid("feature_stds")
+        _require_str(self.payload_path, "payload_path", nonempty=True)
+        _require_sha256(self.configuration_fingerprint, "configuration_fingerprint")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        values = _checked_data(data, cls)
+        return cls(**dict(values))
+
+
+@dataclass(frozen=True, slots=True)
+class CombinedResult(_Contract):
+    status: Literal["OK", "INSUFFICIENT_DATA", "TIMEOUT", "ERROR"]
+    combined_score: float | None
+    weighted_percentile: float | None
+    fisher_tail_score: float | None
+    active_engines: list[str]
+    weights_used: dict[str, float]
+    error: str | None
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        status = _require_literal(
+            self.status, "status",
+            frozenset(("OK", "INSUFFICIENT_DATA", "TIMEOUT", "ERROR")),
+        )
+        score = _require_optional_float(
+            self.combined_score, "combined_score", minimum=0.0, maximum=100.0
+        )
+        weighted = _require_optional_float(
+            self.weighted_percentile, "weighted_percentile", minimum=0.0, maximum=100.0
+        )
+        tail = _require_optional_float(
+            self.fisher_tail_score, "fisher_tail_score", minimum=0.0, maximum=100.0
+        )
+        engines = _require_string_list(
+            self.active_engines, "active_engines", nonempty_items=True
+        )
+        if engines != [name for name in _COMBINED_ENGINE_ORDER if name in engines]:
+            _invalid("active_engines")
+        weights = _require_dict(self.weights_used, "weights_used")
+        if set(weights) != set(engines):
+            _invalid("weights_used")
+        checked_weights = [
+            _require_float(weights[name], "weights_used", minimum=0.0, maximum=1.0)
+            for name in engines
+        ]
+        if any(value == 0.0 for value in checked_weights):
+            _invalid("weights_used")
+        if status == "OK":
+            if not engines or score is None or weighted is None or tail is None or self.error is not None:
+                _invalid("status")
+            if not math.isclose(math.fsum(checked_weights), 1.0, rel_tol=0.0, abs_tol=1e-12):
+                _invalid("weights_used")
+            if not math.isclose(score, 0.5 * weighted + 0.5 * tail, rel_tol=0.0, abs_tol=1e-12):
+                _invalid("combined_score")
+        else:
+            if engines or score is not None or weighted is not None or tail is not None:
+                _invalid("status")
+            error = _require_error_code(self.error, "error")
+            if status == "INSUFFICIENT_DATA" and error != ErrorCode.MINIMUMS_NOT_MET.value:
+                _invalid("error")
+            if status == "TIMEOUT" and error != ErrorCode.ENGINE_TIMEOUT.value:
+                _invalid("error")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> Self:
+        values = _checked_data(data, cls)
+        return cls(**dict(values))
+
+
 def message_key(game_id: str, message_id: str) -> str:
     """Return the unambiguous serialized identity for a game-scoped message."""
 
@@ -610,6 +800,7 @@ class AccountProfile(_Contract):
     minimum_messages: int
     minimum_chars: int
     preprocessing_fingerprint: str
+    temporal_stream_path: str = "unused-temporal-path"
 
     def __post_init__(self) -> None:
         self._validate()
@@ -663,6 +854,7 @@ class AccountProfile(_Contract):
         )
         minimum_chars = _require_int(self.minimum_chars, "minimum_chars", minimum=0)
         _require_sha256(self.preprocessing_fingerprint, "preprocessing_fingerprint")
+        _require_str(self.temporal_stream_path, "temporal_stream_path", nonempty=True)
         if n_messages == 0:
             if (
                 n_chars != 0
@@ -686,6 +878,10 @@ class AccountProfile(_Contract):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> Self:
+        if isinstance(data, Mapping) and "temporal_stream_path" not in data:
+            migrated = dict(data)
+            migrated["temporal_stream_path"] = "unused-temporal-path"
+            data = migrated
         values = _checked_data(data, cls)
         return cls(
             schema_version=_require_schema_version(values["schema_version"]),
@@ -741,6 +937,9 @@ class AccountProfile(_Contract):
             preprocessing_fingerprint=_require_sha256(
                 values["preprocessing_fingerprint"], "preprocessing_fingerprint"
             ),
+            temporal_stream_path=_require_str(
+                values["temporal_stream_path"], "temporal_stream_path", nonempty=True
+            ),
         )
 
 
@@ -753,7 +952,7 @@ class PairCounts(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class EngineResult(_Contract):
-    engine: Literal["stylometry", "semantic"]
+    engine: Literal["stylometry", "semantic", "chronobiology"]
     raw_cosine: float | None
     calibrated_percentile: float | None
     status: Literal["OK", "INSUFFICIENT_DATA", "TIMEOUT", "ERROR"]
@@ -823,7 +1022,7 @@ class EngineResult(_Contract):
 class BaselineDistribution(_Contract):
     schema_version: Literal["1.0"]
     baseline_id: str
-    engine: Literal["stylometry", "semantic"]
+    engine: Literal["stylometry", "semantic", "chronobiology"]
     created_at_utc: str
     source_snapshot_id: str
     configuration_fingerprint: str
@@ -921,6 +1120,8 @@ class ComparisonReport(_Contract):
     suspect_account_id: str
     stylometry: EngineResult
     semantic: EngineResult
+    chronobiology: EngineResult
+    combined: CombinedResult
     banner: Literal["Decision support only. Requires human review."]
 
     BANNER: ClassVar[str] = "Decision support only. Requires human review."
@@ -932,16 +1133,33 @@ class ComparisonReport(_Contract):
         _require_schema_version(self.schema_version)
         _require_str(self.flagged_account_id, "flagged_account_id", nonempty=True)
         _require_str(self.suspect_account_id, "suspect_account_id", nonempty=True)
-        if not isinstance(self.stylometry, EngineResult):
-            _invalid("stylometry")
-        if not isinstance(self.semantic, EngineResult):
-            _invalid("semantic")
-        self.stylometry._validate()
-        self.semantic._validate()
-        if self.stylometry.engine != "stylometry":
-            _invalid("stylometry")
-        if self.semantic.engine != "semantic":
-            _invalid("semantic")
+        base_results = (self.stylometry, self.semantic, self.chronobiology)
+        for name, result in zip(_COMBINED_ENGINE_ORDER, base_results, strict=True):
+            if not isinstance(result, EngineResult):
+                _invalid(name)
+            result._validate()
+            if result.engine != name:
+                _invalid(name)
+        if not isinstance(self.combined, CombinedResult):
+            _invalid("combined")
+        self.combined._validate()
+        active = [result.engine for result in base_results if result.status == "OK"]
+        if self.combined.active_engines != active:
+            _invalid("combined")
+        if not active:
+            if all(result.status == "INSUFFICIENT_DATA" for result in base_results):
+                expected_status = "INSUFFICIENT_DATA"
+                expected_error = ErrorCode.MINIMUMS_NOT_MET.value
+            elif any(result.status == "TIMEOUT" for result in base_results):
+                expected_status = "TIMEOUT"
+                expected_error = ErrorCode.ENGINE_TIMEOUT.value
+            else:
+                expected_status = "ERROR"
+                expected_error = next(
+                    result.error for result in base_results if result.error is not None
+                )
+            if self.combined.status != expected_status or self.combined.error != expected_error:
+                _invalid("combined")
         if self.banner != self.BANNER or not isinstance(self.banner, str):
             _invalid("banner")
 
@@ -956,10 +1174,10 @@ class ComparisonReport(_Contract):
             suspect_account_id=_require_str(
                 values["suspect_account_id"], "suspect_account_id", nonempty=True
             ),
-            stylometry=EngineResult.from_dict(
-                _require_mapping(values["stylometry"], "stylometry")
-            ),
+            stylometry=EngineResult.from_dict(_require_mapping(values["stylometry"], "stylometry")),
             semantic=EngineResult.from_dict(_require_mapping(values["semantic"], "semantic")),
+            chronobiology=EngineResult.from_dict(_require_mapping(values["chronobiology"], "chronobiology")),
+            combined=CombinedResult.from_dict(_require_mapping(values["combined"], "combined")),
             banner=_require_str(values["banner"], "banner", nonempty=True),
         )
 
@@ -1091,11 +1309,12 @@ class EmbeddingModel(Protocol):
 class ComparisonAssets(_Contract):
     stylometry_artifact_path: Path
     semantic_model_dir: Path
-    baseline_paths: Mapping[Literal["stylometry", "semantic"], Path]
+    baseline_paths: Mapping[Literal["stylometry", "semantic", "chronobiology"], Path]
     game_terms_path: Path
     usernames_path: Path
     function_words_path: Path
     cache_dir: Path
+    chronobiology_artifact_path: Path
 
     def __post_init__(self) -> None:
         self._validate()
@@ -1112,6 +1331,7 @@ class ComparisonAssets(_Contract):
         _require_path(self.usernames_path, "usernames_path")
         _require_path(self.function_words_path, "function_words_path")
         _require_path(self.cache_dir, "cache_dir")
+        _require_path(self.chronobiology_artifact_path, "chronobiology_artifact_path")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> Self:
@@ -1120,26 +1340,19 @@ class ComparisonAssets(_Contract):
         if set(baseline_paths) != _ENGINE_NAMES:
             _invalid("baseline_paths")
         return cls(
-            stylometry_artifact_path=_path_from_dict(
-                values["stylometry_artifact_path"], "stylometry_artifact_path"
-            ),
-            semantic_model_dir=_path_from_dict(
-                values["semantic_model_dir"], "semantic_model_dir"
-            ),
+            stylometry_artifact_path=_path_from_dict(values["stylometry_artifact_path"], "stylometry_artifact_path"),
+            semantic_model_dir=_path_from_dict(values["semantic_model_dir"], "semantic_model_dir"),
             baseline_paths={
-                "stylometry": _path_from_dict(
-                    baseline_paths["stylometry"], "baseline_paths"
-                ),
-                "semantic": _path_from_dict(
-                    baseline_paths["semantic"], "baseline_paths"
-                ),
+                name: _path_from_dict(baseline_paths[name], "baseline_paths")
+                for name in _COMBINED_ENGINE_ORDER
             },
             game_terms_path=_path_from_dict(values["game_terms_path"], "game_terms_path"),
             usernames_path=_path_from_dict(values["usernames_path"], "usernames_path"),
-            function_words_path=_path_from_dict(
-                values["function_words_path"], "function_words_path"
-            ),
+            function_words_path=_path_from_dict(values["function_words_path"], "function_words_path"),
             cache_dir=_path_from_dict(values["cache_dir"], "cache_dir"),
+            chronobiology_artifact_path=_path_from_dict(
+                values["chronobiology_artifact_path"], "chronobiology_artifact_path"
+            ),
         )
 
 
@@ -1458,6 +1671,7 @@ class RunConfig(_Contract):
     terminate_timed_out_workers: bool = True
     output_format: Literal["table", "json"] = "table"
     allow_external: bool = False
+    chronobiology_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
         self._validate()
@@ -1469,6 +1683,9 @@ class RunConfig(_Contract):
         _require_float(self.semantic_timeout_s, "semantic_timeout_s", minimum=0.0)
         if self.semantic_timeout_s == 0.0:
             _invalid("semantic_timeout_s")
+        _require_float(self.chronobiology_timeout_s, "chronobiology_timeout_s", minimum=0.0)
+        if self.chronobiology_timeout_s == 0.0:
+            _invalid("chronobiology_timeout_s")
         _require_bool(
             self.terminate_timed_out_workers, "terminate_timed_out_workers"
         )
@@ -1496,6 +1713,9 @@ class RunConfig(_Contract):
                 values["output_format"], "output_format", frozenset(("table", "json"))
             ),
             allow_external=_require_bool(values["allow_external"], "allow_external"),
+            chronobiology_timeout_s=_require_float(
+                values["chronobiology_timeout_s"], "chronobiology_timeout_s", minimum=0.0
+            ),
         )
 
 
@@ -1563,7 +1783,7 @@ def _require_ci(value: object, field_name: str) -> dict[str, list[float]]:
 
 @dataclass(frozen=True, slots=True)
 class EngineEvaluation(_Contract):
-    engine: Literal["stylometry", "semantic"]
+    engine: Literal["stylometry", "semantic", "chronobiology", "combined"]
     roc_auc: float | None
     pr_auc: float | None
     test_base_rate: float
@@ -1580,7 +1800,7 @@ class EngineEvaluation(_Contract):
         self._validate()
 
     def _validate(self) -> None:
-        _require_literal(self.engine, "engine", _ENGINE_NAMES)
+        _require_literal(self.engine, "engine", _EVALUATION_NAMES)
         _require_optional_float(self.roc_auc, "roc_auc", minimum=0.0, maximum=1.0)
         _require_optional_float(self.pr_auc, "pr_auc", minimum=0.0, maximum=1.0)
         _require_float(self.test_base_rate, "test_base_rate", minimum=0.0, maximum=1.0)
@@ -1604,7 +1824,7 @@ class EngineEvaluation(_Contract):
     def from_dict(cls, data: Mapping[str, object]) -> Self:
         values = _checked_data(data, cls)
         return cls(
-            engine=_require_literal(values["engine"], "engine", _ENGINE_NAMES),
+            engine=_require_literal(values["engine"], "engine", _EVALUATION_NAMES),
             roc_auc=_require_optional_float(
                 values["roc_auc"], "roc_auc", minimum=0.0, maximum=1.0
             ),
@@ -1647,6 +1867,8 @@ class EvaluationReport(_Contract):
     partition_sizes: dict[str, int]
     stylometry: EngineEvaluation
     semantic: EngineEvaluation
+    chronobiology: EngineEvaluation
+    combined: EngineEvaluation
     note: Literal["Thresholds are review-prioritization suggestions only."]
 
     NOTE: ClassVar[str] = "Thresholds are review-prioritization suggestions only."
@@ -1658,16 +1880,13 @@ class EvaluationReport(_Contract):
         _require_schema_version(self.schema_version)
         _require_int(self.seed, "seed")
         _require_partition_sizes(self.partition_sizes, "partition_sizes")
-        if not isinstance(self.stylometry, EngineEvaluation):
-            _invalid("stylometry")
-        if not isinstance(self.semantic, EngineEvaluation):
-            _invalid("semantic")
-        self.stylometry._validate()
-        self.semantic._validate()
-        if self.stylometry.engine != "stylometry":
-            _invalid("stylometry")
-        if self.semantic.engine != "semantic":
-            _invalid("semantic")
+        for name in ("stylometry", "semantic", "chronobiology", "combined"):
+            result = getattr(self, name)
+            if not isinstance(result, EngineEvaluation):
+                _invalid(name)
+            result._validate()
+            if result.engine != name:
+                _invalid(name)
         if self.note != self.NOTE or not isinstance(self.note, str):
             _invalid("note")
 
@@ -1684,5 +1903,11 @@ class EvaluationReport(_Contract):
                 _require_mapping(values["stylometry"], "stylometry")
             ),
             semantic=EngineEvaluation.from_dict(_require_mapping(values["semantic"], "semantic")),
+            chronobiology=EngineEvaluation.from_dict(
+                _require_mapping(values["chronobiology"], "chronobiology")
+            ),
+            combined=EngineEvaluation.from_dict(
+                _require_mapping(values["combined"], "combined")
+            ),
             note=_require_str(values["note"], "note", nonempty=True),
         )

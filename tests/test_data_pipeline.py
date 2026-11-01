@@ -3,9 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 from pathlib import Path
-from dataclasses import fields
+from dataclasses import fields, replace
+from datetime import datetime
+from hashlib import sha256
+import time
 
+import authorship_attribution.preprocess as preprocess_module
 import pytest
 
 from authorship_attribution.contracts import (
@@ -13,12 +18,18 @@ from authorship_attribution.contracts import (
     IngestConfig,
     Message,
     PreprocessConfig,
+    TemporalStreamChunk,
     message_key,
 )
-from authorship_attribution.errors import ContractValidationError
+from authorship_attribution.errors import ContractValidationError, ErrorCode
+from authorship_attribution.fingerprints import canonical_json
 from authorship_attribution.ingest import ingest_chat_logs, validate_message
 from authorship_attribution.preprocess import build_account_profiles
-from authorship_attribution.streams import load_normalized_stream, load_raw_stream
+from authorship_attribution.streams import (
+    load_normalized_stream,
+    load_raw_stream,
+    load_temporal_stream,
+)
 
 
 def _message(
@@ -250,6 +261,8 @@ def test_empty_post_filter_profile_and_no_accepted_omission(
     assert profile.chunk_ids == []
     assert load_raw_stream(profile) == []
     assert load_normalized_stream(profile) == []
+    assert load_temporal_stream(profile) == []
+    assert Path(profile.temporal_stream_path).read_bytes() == b""
     assert tuple(field.name for field in fields(AccountProfile)) == (
         "schema_version",
         "account_id",
@@ -269,6 +282,7 @@ def test_empty_post_filter_profile_and_no_accepted_omission(
         "minimum_messages",
         "minimum_chars",
         "preprocessing_fingerprint",
+        "temporal_stream_path",
     )
     assert "omitted_accounts=2" in caplog.text
     assert "kept before filter" not in caplog.text
@@ -287,3 +301,522 @@ def test_minimum_status_determinism_and_no_text_in_logs(tmp_path: Path, caplog: 
     assert first["acct-a"].status == "INSUFFICIENT_DATA"
     assert first["acct-a"].to_dict() == second["acct-a"].to_dict()
     assert marker not in caplog.text
+
+
+def _phase2_message(
+    message_id: str,
+    text: str,
+    timestamp: str,
+    *,
+    game_id: str = "game-a",
+    account_id: str = "acct-a",
+    system: bool = False,
+) -> Message:
+    return Message(
+        schema_version="1.0",
+        message_id=message_id,
+        account_id=account_id,
+        game_id=game_id,
+        channel_id="channel-a",
+        timestamp_utc=timestamp,
+        text=text,
+        is_system=system,
+        source_id="synthetic",
+        source_row=1,
+    )
+
+
+@pytest.fixture
+def phase2_profile(tmp_path: Path) -> AccountProfile:
+    messages = [
+        _phase2_message("a", "aa", "2026-10-01T12:00:00Z"),
+        _phase2_message("b", "bbb", "2026-10-01T12:29:00Z"),
+        _phase2_message("c", "cccc", "2026-10-01T12:59:00Z"),
+    ]
+    return build_account_profiles(
+        messages,
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(
+            minimum_messages=1,
+            minimum_chars=1,
+            chunk_target_mode="messages",
+            chunk_target_value=1,
+        ),
+        output_dir=tmp_path,
+    )["acct-a"]
+
+
+def test_temporal_projection_content_counts_and_canonical_bytes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    marker = "SYNTHETIC_PRIVATE_TEXT_8520"
+    messages = [
+        _phase2_message("a", "a😺", "2026-10-01T12:00:00Z"),
+        _phase2_message("b", " \t ", "2026-10-01T12:00:30Z"),
+        _phase2_message("c", marker, "2026-10-01T12:01:00Z"),
+        _phase2_message("empty", "", "2026-10-01T12:02:00Z"),
+        _phase2_message("system", marker, "2026-10-01T12:03:00Z", system=True),
+    ]
+    with caplog.at_level(logging.DEBUG):
+        profile = build_account_profiles(
+            messages,
+            game_terms=[],
+            usernames=[],
+            config=PreprocessConfig(
+                minimum_messages=1,
+                minimum_chars=1,
+                chunk_target_mode="messages",
+                chunk_target_value=1,
+            ),
+            output_dir=tmp_path,
+        )["acct-a"]
+
+    expected_name = sha256(b"acct-a").hexdigest() + ".ndjson"
+    temporal_path = Path(profile.temporal_stream_path)
+    assert temporal_path == tmp_path.resolve() / "temporal" / expected_name
+    assert temporal_path.is_absolute()
+    temporal = load_temporal_stream(profile)
+    raw = load_raw_stream(profile)
+    normalized = load_normalized_stream(profile)
+    assert all(isinstance(item, TemporalStreamChunk) for item in temporal)
+    assert [item.chunk_id for item in temporal] == profile.chunk_ids
+    assert [item.chunk_id for item in temporal] == [item.chunk_id for item in raw]
+    assert [item.chunk_id for item in temporal] == [item.chunk_id for item in normalized]
+    assert [item.char_counts for item in temporal] == [[2], [3], [len(marker)]]
+    assert [item.timestamps_utc for item in temporal] == [
+        ["2026-10-01T12:00:00Z"],
+        ["2026-10-01T12:00:30Z"],
+        ["2026-10-01T12:01:00Z"],
+    ]
+    assert profile.n_messages == 3
+    assert profile.n_chars == 5 + len(marker)
+    assert profile.session_count == 1
+    assert len({item.session_id for item in temporal}) == 1
+    assert temporal_path.read_bytes() == b"".join(
+        canonical_json(item) + b"\n" for item in temporal
+    )
+    assert set(temporal[0].to_dict()) == {
+        "schema_version",
+        "chunk_id",
+        "account_id",
+        "session_id",
+        "timestamps_utc",
+        "char_counts",
+        "n_messages",
+        "n_chars",
+    }
+    assert marker.encode("utf-8") not in temporal_path.read_bytes()
+    assert marker not in repr(temporal)
+    assert marker not in caplog.text
+    assert "raw_text" not in temporal_path.read_text(encoding="utf-8")
+    assert "normalized_text" not in temporal_path.read_text(encoding="utf-8")
+
+
+def test_temporal_session_boundaries_and_split_chunks(
+    phase2_profile: AccountProfile,
+) -> None:
+    temporal = load_temporal_stream(phase2_profile)
+    assert len(temporal) == 3
+    assert temporal[0].session_id == temporal[1].session_id
+    assert temporal[2].session_id != temporal[1].session_id
+    assert phase2_profile.session_count == 2
+    assert [item.n_messages for item in temporal] == [1, 1, 1]
+    assert [item.n_chars for item in temporal] == [2, 3, 4]
+
+
+def test_temporal_character_chunks_match_raw_chunks(tmp_path: Path) -> None:
+    messages = [
+        _phase2_message("long", "abcdefghij", "2026-10-01T12:00:00Z"),
+        _phase2_message("short-a", "a", "2026-10-01T12:01:00Z"),
+        _phase2_message("short-b", "b", "2026-10-01T12:02:00Z"),
+    ]
+    profile = build_account_profiles(
+        messages,
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(
+            minimum_messages=1,
+            minimum_chars=1,
+            chunk_target_mode="characters",
+            chunk_target_value=5,
+        ),
+        output_dir=tmp_path,
+    )["acct-a"]
+    raw = load_raw_stream(profile)
+    temporal = load_temporal_stream(profile)
+    assert [item.raw_text for item in raw] == [["abcdefghij"], ["a", "b"]]
+    assert [item.char_counts for item in temporal] == [[10], [1, 1]]
+    assert [item.n_messages for item in temporal] == [1, 2]
+    assert [item.chunk_id for item in temporal] == [item.chunk_id for item in raw]
+    assert temporal[0].session_id == temporal[1].session_id
+
+
+def test_temporal_empty_filtered_profile(tmp_path: Path) -> None:
+    profile = build_account_profiles(
+        [_phase2_message("m", "kept before filter", "2026-10-01T12:00:00Z")],
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(utc_hour_filter=[1]),
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert profile.status == "INSUFFICIENT_DATA"
+    assert profile.n_messages == profile.n_chars == profile.session_count == 0
+    assert profile.chunk_ids == []
+    assert load_raw_stream(profile) == []
+    assert load_normalized_stream(profile) == []
+    assert load_temporal_stream(profile) == []
+    assert Path(profile.raw_stream_path).read_bytes() == b""
+    assert Path(profile.normalized_stream_path).read_bytes() == b""
+    assert Path(profile.temporal_stream_path).read_bytes() == b""
+
+
+def test_temporal_partial_utc_filter_retains_prefilter_histogram(tmp_path: Path) -> None:
+    messages = [
+        _phase2_message("before", "morning", "2026-10-01T12:00:00Z"),
+        _phase2_message("after", "kept", "2026-10-01T13:00:00Z"),
+    ]
+    profile = build_account_profiles(
+        messages,
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(
+            minimum_messages=1,
+            minimum_chars=1,
+            utc_hour_filter=[13],
+        ),
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert profile.activity_histogram_utc[12] == 1
+    assert profile.activity_histogram_utc[13] == 1
+    assert profile.n_messages == 1
+    assert profile.n_chars == 4
+    temporal = load_temporal_stream(profile)
+    assert len(temporal) == 1
+    assert temporal[0].timestamps_utc == ["2026-10-01T13:00:00Z"]
+    assert temporal[0].char_counts == [4]
+    assert load_raw_stream(profile)[0].raw_text == ["kept"]
+
+
+def test_temporal_preserves_fractional_and_pre_epoch_timestamps(tmp_path: Path) -> None:
+    timestamps = [
+        "1969-12-31T23:59:59.999999Z",
+        "1970-01-01T00:00:00.123456789Z",
+    ]
+    profile = build_account_profiles(
+        [
+            _phase2_message("a", "x", timestamps[0]),
+            _phase2_message("b", "y", timestamps[1]),
+        ],
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1),
+        output_dir=tmp_path,
+    )["acct-a"]
+    temporal = load_temporal_stream(profile)
+    assert len(temporal) == 1
+    assert temporal[0].timestamps_utc == timestamps
+    epochs = [
+        datetime.fromisoformat(f"{timestamp[:-1]}+00:00").timestamp()
+        for timestamp in temporal[0].timestamps_utc
+    ]
+    assert epochs[0] < 0.0 < epochs[1]
+    assert epochs == sorted(epochs)
+
+
+def test_temporal_tie_order_and_repeat_are_deterministic(tmp_path: Path) -> None:
+    messages = [
+        _phase2_message("same", "zeta text", "2026-10-01T12:00:00Z", game_id="zeta"),
+        _phase2_message("same", "alpha text", "2026-10-01T12:00:00Z", game_id="alpha"),
+    ]
+    config = PreprocessConfig(
+        minimum_messages=1,
+        minimum_chars=1,
+        chunk_target_mode="messages",
+        chunk_target_value=1,
+    )
+    first = build_account_profiles(
+        messages, game_terms=[], usernames=[], config=config, output_dir=tmp_path
+    )["acct-a"]
+    paths = [
+        Path(first.raw_stream_path),
+        Path(first.normalized_stream_path),
+        Path(first.temporal_stream_path),
+        tmp_path.resolve() / "profiles" / (sha256(b"acct-a").hexdigest() + ".json"),
+    ]
+    first_bytes = [path.read_bytes() for path in paths]
+    assert [item.raw_text for item in load_raw_stream(first)] == [
+        ["alpha text"],
+        ["zeta text"],
+    ]
+    second = build_account_profiles(
+        list(reversed(messages)),
+        game_terms=[],
+        usernames=[],
+        config=config,
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert second.to_dict() == first.to_dict()
+    assert [path.read_bytes() for path in paths] == first_bytes
+
+
+def test_temporal_reader_never_opens_text_streams(
+    phase2_profile: AccountProfile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = {
+        Path(phase2_profile.raw_stream_path),
+        Path(phase2_profile.normalized_stream_path),
+    }
+    original_open = Path.open
+
+    def guarded_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self in blocked:
+            pytest.fail("temporal reader opened a text-bearing stream")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    assert len(load_temporal_stream(phase2_profile)) == 3
+
+
+def test_temporal_reader_legacy_path_is_not_fabricated(
+    phase2_profile: AccountProfile,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    legacy = replace(phase2_profile, temporal_stream_path="unused-temporal-path")
+    with pytest.raises(ContractValidationError) as caught:
+        load_temporal_stream(legacy)
+    assert str(caught.value) == "path:ARTIFACT_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("blank", "line:ARTIFACT_INVALID"),
+        ("invalid_utf8", "path:ARTIFACT_INVALID"),
+        ("invalid_json", "path:ARTIFACT_INVALID"),
+        ("nonfinite", "path:ARTIFACT_INVALID"),
+        ("non_object", "object:ARTIFACT_INVALID"),
+        ("unknown_field", "object:INPUT_INVALID"),
+        ("missing_field", "session_id:INPUT_INVALID"),
+        ("bad_schema", "schema_version:INPUT_INVALID"),
+        ("bad_timestamp", "timestamps_utc:INPUT_INVALID"),
+        ("bad_char_type", "char_counts:INPUT_INVALID"),
+        ("negative_char_count", "char_counts:INPUT_INVALID"),
+        ("wrong_account", "account_id:ARTIFACT_INVALID"),
+        ("wrong_chunk", "chunk_ids:ARTIFACT_INVALID"),
+        ("reordered_chunks", "chunk_ids:ARTIFACT_INVALID"),
+        ("duplicate_chunk", "chunk_ids:ARTIFACT_INVALID"),
+        ("bad_record_count", "n_messages:INPUT_INVALID"),
+        ("bad_record_chars", "n_chars:INPUT_INVALID"),
+        ("profile_message_total", "n_messages:ARTIFACT_INVALID"),
+        ("profile_char_total", "n_chars:ARTIFACT_INVALID"),
+        ("cross_chunk_time", "timestamps_utc:ARTIFACT_INVALID"),
+        ("session_reappears", "session_id:ARTIFACT_INVALID"),
+        ("session_total", "session_count:ARTIFACT_INVALID"),
+    ],
+)
+def test_temporal_reader_rejects_malformed_and_inconsistent_streams(
+    phase2_profile: AccountProfile,
+    case: str,
+    expected: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "SYNTHETIC_PRIVATE_ERROR_MARKER_2851"
+    path = Path(phase2_profile.temporal_stream_path)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    if case == "blank":
+        path.write_bytes(b"\n")
+    elif case == "invalid_utf8":
+        path.write_bytes(b"\xff")
+    elif case == "invalid_json":
+        path.write_bytes(b"{\n")
+    elif case == "nonfinite":
+        path.write_bytes(b'{"value":NaN}\n')
+    elif case == "non_object":
+        path.write_bytes(b"[]\n")
+    else:
+        if case == "unknown_field":
+            records[0][marker] = marker
+        elif case == "missing_field":
+            del records[0]["session_id"]
+        elif case == "bad_schema":
+            records[0]["schema_version"] = "2.0"
+        elif case == "bad_timestamp":
+            records[0]["timestamps_utc"] = [marker]
+        elif case == "bad_char_type":
+            records[0]["char_counts"] = [True]
+        elif case == "negative_char_count":
+            records[0]["char_counts"] = [-1]
+        elif case == "wrong_account":
+            records[0]["account_id"] = marker
+        elif case == "wrong_chunk":
+            records[0]["chunk_id"] = marker
+        elif case == "reordered_chunks":
+            records.reverse()
+        elif case == "duplicate_chunk":
+            records[1] = dict(records[0])
+        elif case == "bad_record_count":
+            records[0]["n_messages"] = 2
+        elif case == "bad_record_chars":
+            records[0]["n_chars"] += 1
+        elif case == "profile_message_total":
+            records[0]["timestamps_utc"].append(records[0]["timestamps_utc"][0])
+            records[0]["char_counts"].append(0)
+            records[0]["n_messages"] += 1
+        elif case == "profile_char_total":
+            records[0]["char_counts"][0] += 1
+            records[0]["n_chars"] += 1
+        elif case == "cross_chunk_time":
+            records[1]["timestamps_utc"] = ["2026-10-01T11:59:00Z"]
+        elif case == "session_reappears":
+            records[1]["session_id"] = "other-session"
+            records[2]["session_id"] = records[0]["session_id"]
+        elif case == "session_total":
+            records[2]["session_id"] = records[0]["session_id"]
+        else:
+            raise AssertionError("unknown test case")
+        path.write_bytes(b"".join(canonical_json(item) + b"\n" for item in records))
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(ContractValidationError) as caught:
+            load_temporal_stream(phase2_profile)
+    assert str(caught.value) == expected
+    assert marker not in str(caught.value)
+    assert marker not in caplog.text
+
+
+def test_temporal_reader_rejects_non_profile() -> None:
+    with pytest.raises(ContractValidationError) as caught:
+        load_temporal_stream(None)  # type: ignore[arg-type]
+    assert str(caught.value) == "profile:ARTIFACT_INVALID"
+
+
+def test_expiration_includes_temporal_and_preserves_fresh_files(tmp_path: Path) -> None:
+    old_paths = []
+    fresh_paths = []
+    for folder_name in ("raw", "normalized", "temporal"):
+        folder = tmp_path / folder_name
+        folder.mkdir(parents=True)
+        old_path = folder / "expired.ndjson"
+        fresh_path = folder / "fresh.ndjson"
+        old_path.write_bytes(b"old\n")
+        fresh_path.write_bytes(b"fresh\n")
+        old_time = time.time() - 8 * 86400
+        os.utime(old_path, (old_time, old_time))
+        old_paths.append(old_path)
+        fresh_paths.append(fresh_path)
+
+    build_account_profiles(
+        [_phase2_message("m", "x", "2026-10-01T12:00:00Z")],
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1, cache_retention_days=7),
+        output_dir=tmp_path,
+    )
+    assert all(not path.exists() for path in old_paths)
+    assert all(path.read_bytes() == b"fresh\n" for path in fresh_paths)
+
+
+def test_zero_retention_cleans_temporal_without_removing_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered: set[Path] = set()
+    monkeypatch.setattr(preprocess_module, "_REGISTERED_CLEANUP", registered)
+    monkeypatch.setattr(preprocess_module.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(preprocess_module.atexit, "unregister", lambda callback: None)
+    profile = build_account_profiles(
+        [_phase2_message("m", "x", "2026-10-01T12:00:00Z")],
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1, cache_retention_days=0),
+        output_dir=tmp_path,
+    )["acct-a"]
+    stream_paths = {
+        Path(profile.raw_stream_path),
+        Path(profile.normalized_stream_path),
+        Path(profile.temporal_stream_path),
+    }
+    profile_path = tmp_path.resolve() / "profiles" / (sha256(b"acct-a").hexdigest() + ".json")
+    assert registered == stream_paths
+    assert all(path.exists() for path in stream_paths)
+    preprocess_module._cleanup_at_exit()
+    assert all(not path.exists() for path in stream_paths)
+    assert profile_path.exists()
+
+
+def test_positive_retention_rewrite_unmarks_prior_zero_retention_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered: set[Path] = set()
+    monkeypatch.setattr(preprocess_module, "_REGISTERED_CLEANUP", registered)
+    monkeypatch.setattr(preprocess_module.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(preprocess_module.atexit, "unregister", lambda callback: None)
+    messages = [_phase2_message("m", "x", "2026-10-01T12:00:00Z")]
+    first = build_account_profiles(
+        messages,
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1, cache_retention_days=0),
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert Path(first.temporal_stream_path) in registered
+    second = build_account_profiles(
+        messages,
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1, cache_retention_days=7),
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert registered == set()
+    preprocess_module._cleanup_at_exit()
+    assert Path(second.temporal_stream_path).exists()
+
+
+def test_temporal_preprocessing_and_reader_make_no_network_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("network access attempted")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    profile = build_account_profiles(
+        [_phase2_message("m", "x", "2026-10-01T12:00:00Z")],
+        game_terms=[],
+        usernames=[],
+        config=PreprocessConfig(minimum_messages=1, minimum_chars=1),
+        output_dir=tmp_path,
+    )["acct-a"]
+    assert len(load_temporal_stream(profile)) == 1
+
+
+def test_failed_temporal_replace_is_sanitized_and_does_not_publish_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "SYNTHETIC_PRIVATE_IO_MARKER_6381"
+    original_replace = preprocess_module.os.replace
+
+    def guarded_replace(source: object, destination: object) -> None:
+        if Path(destination).parent.name == "temporal":
+            raise OSError(marker)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(preprocess_module.os, "replace", guarded_replace)
+    with pytest.raises(ContractValidationError) as caught:
+        build_account_profiles(
+            [_phase2_message("m", marker, "2026-10-01T12:00:00Z")],
+            game_terms=[],
+            usernames=[],
+            config=PreprocessConfig(minimum_messages=1, minimum_chars=1),
+            output_dir=tmp_path,
+        )
+    assert caught.value.code is ErrorCode.ARTIFACT_INVALID
+    assert str(caught.value) == "path:ARTIFACT_INVALID"
+    assert marker not in str(caught.value)
+    assert not (tmp_path / "profiles" / (sha256(b"acct-a").hexdigest() + ".json")).exists()
+    assert list((tmp_path / "temporal").glob(".*")) == []

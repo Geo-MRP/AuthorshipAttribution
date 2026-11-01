@@ -1,11 +1,14 @@
 """Shared, versioned contracts for authorship-attribution components."""
 
-from .calibration import calibrate_cosine, check_baseline_compat
+from .calibration import calibrate_cosine, check_baseline_compat, compute_combined_result
 from .contracts import (
     AccountProfile,
     BaselineConfig,
     BaselineDistribution,
     Chunk,
+    ChronobiologyArtifact,
+    ChronobiologyConfig,
+    CombinedResult,
     ComparisonAssets,
     ComparisonReport,
     EmbeddingModel,
@@ -24,6 +27,7 @@ from .contracts import (
     SemanticConfig,
     StylometryArtifact,
     StylometryConfig,
+    TemporalStreamChunk,
     message_key,
 )
 from .errors import ContractValidationError, ErrorCode, error_code_for
@@ -37,6 +41,7 @@ from .fileformats import (
 from .fingerprints import (
     NORMALIZATION_SPEC_VERSION,
     canonical_json,
+    chronobiology_fingerprint,
     fingerprint,
     preprocessing_fingerprint,
     semantic_fingerprint,
@@ -49,6 +54,9 @@ __all__ = [
     "BaselineConfig",
     "BaselineDistribution",
     "Chunk",
+    "ChronobiologyArtifact",
+    "ChronobiologyConfig",
+    "CombinedResult",
     "ComparisonAssets",
     "ComparisonReport",
     "ContractValidationError",
@@ -70,10 +78,13 @@ __all__ = [
     "SemanticConfig",
     "StylometryArtifact",
     "StylometryConfig",
+    "TemporalStreamChunk",
     "TermList",
     "calibrate_cosine",
     "canonical_json",
+    "chronobiology_fingerprint",
     "check_baseline_compat",
+    "compute_combined_result",
     "error_code_for",
     "fingerprint",
     "load_labeled_pairs",

@@ -11,7 +11,10 @@ from typing import Literal
 
 from .contracts import (
     AccountProfile,
+    BaselineDistribution,
+    ChronobiologyConfig,
     ComparisonAssets,
+    EngineResult,
     EngineEvaluation,
     EvaluationConfig,
     EvaluationReport,
@@ -20,11 +23,13 @@ from .contracts import (
     StylometryArtifact,
     StylometryConfig,
 )
-from .calibration import calibrate_cosine
-from .errors import ContractValidationError, ErrorCode
+from .calibration import calibrate_cosine, compute_combined_result
+from .chronobiology import compute_chronobiology_raw, fit_chronobiology_artifact
+from .errors import ContractValidationError, ErrorCode, error_code_for
 from .fileformats import load_term_list, write_json_artifact
+from .fingerprints import semantic_fingerprint
 from .semantic import compute_semantic_raw, load_local_model
-from .streams import load_normalized_stream, load_raw_stream
+from .streams import load_normalized_stream, load_raw_stream, load_temporal_stream
 from .stylometry import compute_stylometry_raw, fit_stylometry_artifact
 
 
@@ -121,16 +126,20 @@ def _metrics(rows: Sequence[tuple[float, bool]], threshold: float) -> tuple[floa
     return precision, recall
 
 
-def _threshold(rows: Sequence[tuple[float, bool]], minimum_precision: float) -> tuple[float, bool]:
-    candidates = sorted({score for score, _ in rows} | {math.nextafter(max((s for s, _ in rows), default=0.0), math.inf)})
-    scored = [(threshold, *_metrics(rows, threshold)) for threshold in candidates]
+def _threshold(
+    rows: Sequence[tuple[float, bool]], minimum_precision: float
+) -> tuple[float, bool]:
+    if not rows:
+        return 100.0, False
+    candidates = {score for score, _ in rows}
+    sentinel = math.nextafter(max(candidates), math.inf)
+    if sentinel <= 100.0:
+        candidates.add(sentinel)
+    scored = [(threshold, *_metrics(rows, threshold)) for threshold in sorted(candidates)]
     qualifying = [row for row in scored if row[1] >= minimum_precision]
     pool = qualifying if qualifying else scored
-    best = max(pool, key=lambda row: (row[2], row[1], -row[0])) if pool else (100.0, 0.0, 0.0)
-    # Candidate scores are calibrated percentiles; raw score thresholds are
-    # selected in the same domain as those empirical calibration values.
+    best = max(pool, key=lambda row: (row[2], row[1], -row[0]))
     return float(best[0]), bool(qualifying)
-
 
 def _ci(values: Sequence[float], seed: int, level: float, n_bootstrap: int) -> list[float]:
     if not values:
@@ -146,8 +155,38 @@ def _ci(values: Sequence[float], seed: int, level: float, n_bootstrap: int) -> l
     return [float(samples[low]), float(samples[high])]
 
 
+def _bootstrap_metric_ci(
+    rows: Sequence[tuple[float, bool]],
+    *,
+    metric: Literal["roc_auc", "precision", "recall"],
+    threshold: float,
+    config: EvaluationConfig,
+    seed_offset: int,
+) -> list[float]:
+    if not rows:
+        return [0.0, 0.0]
+    rng = random.Random(config.seed + seed_offset)
+    values: list[float] = []
+    for _ in range(config.n_bootstrap):
+        sample = [rng.choice(rows) for _ in rows]
+        if metric == "roc_auc":
+            value = _auc(sample)
+            if value is None:
+                continue
+        else:
+            precision, recall = _metrics(sample, threshold)
+            value = precision if metric == "precision" else recall
+        values.append(float(value))
+    if not values:
+        return [0.0, 0.0]
+    values.sort()
+    alpha = (1.0 - config.ci_level) / 2.0
+    low = min(len(values) - 1, max(0, int(alpha * len(values))))
+    high = min(len(values) - 1, max(0, int((1.0 - alpha) * len(values)) - 1))
+    return [values[low], values[high]]
+
 def _evaluate_engine(
-    engine: Literal["stylometry", "semantic"],
+    engine: Literal["stylometry", "semantic", "chronobiology", "combined"],
     validation: Sequence[tuple[float, bool]],
     test: Sequence[tuple[float, bool]],
     test_raw: Sequence[tuple[float, bool]],
@@ -158,17 +197,29 @@ def _evaluate_engine(
     precision, recall = _metrics(test, threshold)
     same = sum(label for _, label in test)
     different = len(test) - same
-    auc = _auc(test_raw)
-    pr = _pr_auc(test_raw)
     return EngineEvaluation(
-        engine=engine, roc_auc=auc, pr_auc=pr,
+        engine=engine,
+        roc_auc=_auc(test_raw),
+        pr_auc=_pr_auc(test_raw),
         test_base_rate=(same / len(test) if test else 0.0),
-        threshold_percentile=threshold, precision_constraint_met=constraint,
-        precision=precision, recall=recall, support_same=same,
-        support_different=different, excluded_insufficient_data=excluded,
-        ci={"roc_auc": [0.0 if auc is None else auc, 0.0 if auc is None else auc],
-            "precision": _ci([precision], config.seed, config.ci_level, config.n_bootstrap),
-            "recall": _ci([recall], config.seed + 1, config.ci_level, config.n_bootstrap)},
+        threshold_percentile=threshold,
+        precision_constraint_met=constraint,
+        precision=precision,
+        recall=recall,
+        support_same=same,
+        support_different=different,
+        excluded_insufficient_data=excluded,
+        ci={
+            "roc_auc": _bootstrap_metric_ci(
+                test_raw, metric="roc_auc", threshold=threshold, config=config, seed_offset=0
+            ),
+            "precision": _bootstrap_metric_ci(
+                test, metric="precision", threshold=threshold, config=config, seed_offset=1
+            ),
+            "recall": _bootstrap_metric_ci(
+                test, metric="recall", threshold=threshold, config=config, seed_offset=2
+            ),
+        },
     )
 
 
@@ -181,111 +232,272 @@ def evaluate_labeled_pairs(
     seed: int,
     output_path: Path,
 ) -> EvaluationReport:
-    """Evaluate held-out pairs after same-label connected-component splitting."""
+    """Evaluate held-out pairs using account-disjoint training-only references."""
+    if not isinstance(assets, ComparisonAssets) or not isinstance(config, EvaluationConfig):
+        raise ContractValidationError("input", ErrorCode.INPUT_INVALID)
+    if not isinstance(output_path, Path) or type(seed) is not int:
+        raise ContractValidationError("input", ErrorCode.INPUT_INVALID)
+    assets._validate()
+    config._validate()
+    for pair in pairs:
+        if not isinstance(pair, LabeledPair):
+            raise ContractValidationError("pair", ErrorCode.INPUT_INVALID)
+        pair._validate()
+
     assignments = _partition_accounts(pairs, seed, config.split_fractions)
     partitions: dict[str, list[LabeledPair]] = {"train": [], "validation": [], "test": []}
     for pair in pairs:
-        left_part, right_part = assignments[pair.account_id_a], assignments[pair.account_id_b]
+        left_part = assignments[pair.account_id_a]
+        right_part = assignments[pair.account_id_b]
         if left_part == right_part:
             partitions[left_part].append(pair)
-    # Train artifacts are fit from train-partition account profiles, not from
-    # validation/test records; cross-partition pairs are omitted above.
-    train_accounts = sorted({p.account_id_a for p in partitions["train"]} | {p.account_id_b for p in partitions["train"]})
-    training_profiles = [profiles[account] for account in train_accounts if account in profiles and profiles[account].status == "READY"]
-    function_words = load_term_list(assets.function_words_path, require_lang=True)
+
+    train_accounts = sorted(
+        {pair.account_id_a for pair in partitions["train"]}
+        | {pair.account_id_b for pair in partitions["train"]}
+    )
+    training_profiles = [
+        profiles[account] for account in train_accounts
+        if account in profiles and profiles[account].status == "READY"
+    ]
     if len(training_profiles) < 2:
         raise ContractValidationError("training_accounts", ErrorCode.MINIMUMS_NOT_MET)
+    for profile in training_profiles:
+        profile._validate()
     min_messages = max(profile.minimum_messages for profile in training_profiles)
     min_chars = max(profile.minimum_chars for profile in training_profiles)
+    training_profiles = [
+        profile for profile in training_profiles
+        if profile.n_messages >= min_messages and profile.n_chars >= min_chars
+    ]
+    if len(training_profiles) < 2:
+        raise ContractValidationError("training_accounts", ErrorCode.MINIMUMS_NOT_MET)
+    preprocessing_fps = {profile.preprocessing_fingerprint for profile in training_profiles}
+    if len(preprocessing_fps) != 1:
+        raise ContractValidationError("preprocessing_fingerprint", ErrorCode.BASELINE_CONFIG_MISMATCH)
+    preprocessing_fp = next(iter(preprocessing_fps))
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ContractValidationError("output_path", ErrorCode.ARTIFACT_INVALID) from None
+    words = load_term_list(assets.function_words_path, require_lang=True)
     stylo_config = StylometryConfig(minimum_messages=min_messages, minimum_chars=min_chars)
-    artifact = fit_stylometry_artifact(
-        [load_raw_stream(profile) for profile in training_profiles],
-        function_words=function_words.entries, config=stylo_config, seed=seed,
-        output_dir=output_path.parent / "evaluation-artifacts",
-    )
+    chrono_config = ChronobiologyConfig(minimum_messages=min_messages, minimum_chars=min_chars)
     model_config = SemanticConfig(
-        model_dir=assets.semantic_model_dir, cache_dir=assets.cache_dir,
-        center_embeddings=False, minimum_messages=min_messages, minimum_chars=min_chars,
+        model_dir=assets.semantic_model_dir,
+        cache_dir=assets.cache_dir,
+        center_embeddings=False,
+        minimum_messages=min_messages,
+        minimum_chars=min_chars,
     )
-    model = load_local_model(model_config)
-    raw_by_engine: dict[str, dict[LabeledPair, float]] = {"stylometry": {}, "semantic": {}}
-    validation_raw: dict[str, dict[LabeledPair, float]] = {"stylometry": {}, "semantic": {}}
-    exclusions = {"stylometry": 0, "semantic": 0}
-    for part in ("train", "validation", "test"):
-        for pair in partitions[part]:
-            left, right = profiles.get(pair.account_id_a), profiles.get(pair.account_id_b)
-            if left is None or right is None or any(
-                p.status != "READY" or p.n_messages < min_messages or p.n_chars < min_chars for p in (left, right)
-            ):
-                exclusions["stylometry"] += int(part != "train")
-                exclusions["semantic"] += int(part != "train")
-                continue
-            if part == "train":
-                # Training labels establish the artifact only.
-                continue
-            destination = validation_raw if part == "validation" else raw_by_engine
-            destination["stylometry"][pair] = compute_stylometry_raw(
-                load_raw_stream(left), load_raw_stream(right), artifact=artifact, config=stylo_config
-            )
-            destination["semantic"][pair] = compute_semantic_raw(
-                load_normalized_stream(left), load_normalized_stream(right), model=model, config=model_config
-            )
-    # Training different-pair scores alone define the evaluation calibration references.
-    train_scores: dict[str, list[float]] = {"stylometry": [], "semantic": []}
-    for pair in (item for item in partitions["train"] if item.label == "different"):
-        left, right = profiles.get(pair.account_id_a), profiles.get(pair.account_id_b)
-        if left is None or right is None or left.status != "READY" or right.status != "READY":
-            continue
-        train_scores["stylometry"].append(compute_stylometry_raw(
-            load_raw_stream(left), load_raw_stream(right), artifact=artifact, config=stylo_config
-        ))
-        train_scores["semantic"].append(compute_semantic_raw(
-            load_normalized_stream(left), load_normalized_stream(right), model=model, config=model_config
-        ))
-    baselines: dict[str, BaselineDistribution] = {}
-    for engine in ("stylometry", "semantic"):
-        values = sorted(train_scores[engine])
-        if not values:
-            continue
-        baselines[engine] = BaselineDistribution(
-            schema_version="1.0", baseline_id=f"evaluation-{engine}", engine=engine,
-            created_at_utc="2026-10-01T00:00:00Z", source_snapshot_id="evaluation-training",
-            configuration_fingerprint="0" * 64, random_seed=seed,
-            calibration_population="known_different_account_pairs", n_pairs=len(values),
-            sorted_raw_cosines=values, minimum_messages=min_messages,
-            minimum_chars=min_chars, strata_counts={}, centering_vector_path=None,
+    artifact_dir = output_path.parent / "evaluation-artifacts"
+    try:
+        stylo_artifact = fit_stylometry_artifact(
+            [load_raw_stream(profile) for profile in training_profiles],
+            function_words=words.entries,
+            config=stylo_config,
+            seed=seed,
+            output_dir=artifact_dir,
         )
-    evaluation_rows: dict[str, dict[str, list[tuple[float, bool]]]] = {
-        engine: {"validation": [], "test": []} for engine in ("stylometry", "semantic")
+    except Exception:
+        stylo_artifact = None
+    try:
+        chrono_artifact = fit_chronobiology_artifact(
+            [load_temporal_stream(profile) for profile in training_profiles],
+            config=chrono_config,
+            preprocessing_fp=preprocessing_fp,
+            output_dir=artifact_dir,
+        )
+    except Exception:
+        chrono_artifact = None
+    try:
+        model = load_local_model(model_config)
+    except Exception:
+        model = None
+
+    engine_names = ("stylometry", "semantic", "chronobiology")
+
+    def raw_score(engine: str, left: AccountProfile, right: AccountProfile) -> float:
+        if engine == "stylometry":
+            if stylo_artifact is None:
+                raise ContractValidationError("training_baselines", ErrorCode.MINIMUMS_NOT_MET)
+            return compute_stylometry_raw(
+                load_raw_stream(left), load_raw_stream(right),
+                artifact=stylo_artifact, config=stylo_config,
+            )
+        if engine == "semantic":
+            if model is None:
+                raise ContractValidationError("training_baselines", ErrorCode.MINIMUMS_NOT_MET)
+            return compute_semantic_raw(
+                load_normalized_stream(left), load_normalized_stream(right),
+                model=model, config=model_config,
+            )
+        if chrono_artifact is None:
+            raise ContractValidationError("training_baselines", ErrorCode.MINIMUMS_NOT_MET)
+        return compute_chronobiology_raw(
+            load_temporal_stream(left), load_temporal_stream(right),
+            artifact=chrono_artifact, config=chrono_config,
+        )
+
+    train_scores: dict[str, list[float]] = {name: [] for name in engine_names}
+    for pair in partitions["train"]:
+        if pair.label != "different":
+            continue
+        left = profiles.get(pair.account_id_a)
+        right = profiles.get(pair.account_id_b)
+        if left is None or right is None or any(
+            profile.status != "READY"
+            or profile.n_messages < min_messages
+            or profile.n_chars < min_chars
+            or profile.preprocessing_fingerprint != preprocessing_fp
+            for profile in (left, right)
+        ):
+            continue
+        for engine in engine_names:
+            try:
+                value = float(raw_score(engine, left, right))
+                if math.isfinite(value) and -1.0 <= value <= 1.0:
+                    train_scores[engine].append(value)
+            except Exception:
+                continue
+    if any(not train_scores[engine] for engine in engine_names):
+        raise ContractValidationError("training_baselines", ErrorCode.MINIMUMS_NOT_MET)
+    if stylo_artifact is None or chrono_artifact is None or model is None:
+        raise ContractValidationError("training_baselines", ErrorCode.MINIMUMS_NOT_MET)
+
+    fingerprints = {
+        "stylometry": stylo_artifact.configuration_fingerprint,
+        "semantic": semantic_fingerprint(
+            model_config,
+            model.model_fingerprint,
+            getattr(model, "tokenizer_sha256", model.model_fingerprint),
+            preprocessing_fp,
+        ),
+        "chronobiology": chrono_artifact.configuration_fingerprint,
     }
-    for engine in evaluation_rows:
-        for part in ("validation", "test"):
-            for pair in partitions[part]:
-                raw = (validation_raw if part == "validation" else raw_by_engine)[engine].get(pair)
-                if raw is not None:
-                    calibrated = calibrate_cosine(raw, baselines[engine]) if engine in baselines else 0.0
-                    evaluation_rows[engine][part].append((calibrated, pair.label == "same"))
+    baselines: dict[str, BaselineDistribution] = {}
+    for engine in engine_names:
+        values = sorted(train_scores[engine])
+        baselines[engine] = BaselineDistribution(
+            schema_version="1.0",
+            baseline_id=f"evaluation-{engine}",
+            engine=engine,
+            created_at_utc="2026-10-01T00:00:00Z",
+            source_snapshot_id="evaluation-training",
+            configuration_fingerprint=fingerprints[engine],
+            random_seed=seed,
+            calibration_population="known_different_account_pairs",
+            n_pairs=len(values),
+            sorted_raw_cosines=values,
+            minimum_messages=min_messages,
+            minimum_chars=min_chars,
+            strata_counts={},
+            centering_vector_path=None,
+        )
+
+    names = (*engine_names, "combined")
+    rows: dict[str, dict[str, list[tuple[float, bool]]]] = {
+        name: {"validation": [], "test": [], "test_raw": []} for name in names
+    }
+    exclusions = {name: 0 for name in names}
+
+    def failure(
+        engine: str,
+        left: AccountProfile | None,
+        right: AccountProfile | None,
+        status: str,
+        code: ErrorCode,
+    ) -> EngineResult:
+        return EngineResult(
+            engine=engine,
+            raw_cosine=None,
+            calibrated_percentile=None,
+            status=status,
+            n_messages={
+                "candidate": 0 if left is None else left.n_messages,
+                "suspect": 0 if right is None else right.n_messages,
+            },
+            n_chars={
+                "candidate": 0 if left is None else left.n_chars,
+                "suspect": 0 if right is None else right.n_chars,
+            },
+            error=code.value,
+        )
+
+    for partition in ("validation", "test"):
+        for pair in partitions[partition]:
+            left = profiles.get(pair.account_id_a)
+            right = profiles.get(pair.account_id_b)
+            outcomes: dict[str, EngineResult] = {}
+            for engine in engine_names:
+                if left is None or right is None or any(
+                    profile.status != "READY"
+                    or profile.n_messages < min_messages
+                    or profile.n_chars < min_chars
+                    for profile in (left, right)
+                ):
+                    result = failure(engine, left, right, "INSUFFICIENT_DATA", ErrorCode.MINIMUMS_NOT_MET)
+                elif any(
+                    profile.preprocessing_fingerprint != preprocessing_fp
+                    for profile in (left, right)
+                ):
+                    result = failure(engine, left, right, "ERROR", ErrorCode.BASELINE_CONFIG_MISMATCH)
+                else:
+                    try:
+                        raw = float(raw_score(engine, left, right))
+                        percentile = calibrate_cosine(raw, baselines[engine])
+                        result = EngineResult(
+                            engine=engine,
+                            raw_cosine=raw,
+                            calibrated_percentile=percentile,
+                            status="OK",
+                            n_messages={"candidate": left.n_messages, "suspect": right.n_messages},
+                            n_chars={"candidate": left.n_chars, "suspect": right.n_chars},
+                            error=None,
+                        )
+                    except Exception as exc:
+                        result = failure(engine, left, right, "ERROR", error_code_for(exc))
+                outcomes[engine] = result
+                if result.status == "OK":
+                    rows[engine][partition].append((result.calibrated_percentile, pair.label == "same"))
+                    if partition == "test":
+                        rows[engine]["test_raw"].append((result.raw_cosine, pair.label == "same"))
+                else:
+                    exclusions[engine] += 1
+            combined = compute_combined_result(
+                outcomes["stylometry"], outcomes["semantic"], outcomes["chronobiology"]
+            )
+            if combined.status == "OK":
+                rows["combined"][partition].append((combined.combined_score, pair.label == "same"))
+                if partition == "test":
+                    rows["combined"]["test_raw"].append((combined.combined_score, pair.label == "same"))
+            else:
+                exclusions["combined"] += 1
+
     report = EvaluationReport(
-        schema_version="1.0", seed=seed,
+        schema_version="1.0",
+        seed=seed,
         partition_sizes={name: len(values) for name, values in partitions.items()},
         stylometry=_evaluate_engine(
-            "stylometry", evaluation_rows["stylometry"]["validation"],
-            evaluation_rows["stylometry"]["test"],
-            [(raw_by_engine["stylometry"][pair], pair.label == "same")
-             for pair in partitions["test"] if pair in raw_by_engine["stylometry"]],
-            exclusions["stylometry"], config,
+            "stylometry", rows["stylometry"]["validation"], rows["stylometry"]["test"],
+            rows["stylometry"]["test_raw"], exclusions["stylometry"], config,
         ),
         semantic=_evaluate_engine(
-            "semantic", evaluation_rows["semantic"]["validation"],
-            evaluation_rows["semantic"]["test"],
-            [(raw_by_engine["semantic"][pair], pair.label == "same")
-             for pair in partitions["test"] if pair in raw_by_engine["semantic"]],
-            exclusions["semantic"], config,
+            "semantic", rows["semantic"]["validation"], rows["semantic"]["test"],
+            rows["semantic"]["test_raw"], exclusions["semantic"], config,
+        ),
+        chronobiology=_evaluate_engine(
+            "chronobiology", rows["chronobiology"]["validation"], rows["chronobiology"]["test"],
+            rows["chronobiology"]["test_raw"], exclusions["chronobiology"], config,
+        ),
+        combined=_evaluate_engine(
+            "combined", rows["combined"]["validation"], rows["combined"]["test"],
+            rows["combined"]["test_raw"], exclusions["combined"], config,
         ),
         note=EvaluationReport.NOTE,
     )
     write_json_artifact(report, output_path)
     return report
-
 
 __all__ = ["evaluate_labeled_pairs"]
