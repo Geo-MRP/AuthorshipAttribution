@@ -4,6 +4,16 @@ Local data contracts, ingestion/preprocessing, and semantic scoring foundations
 for a moderator decision-support system. Scoring outputs are review-support
 measurements and require human review.
 
+## Documentation
+
+Full documentation lives in [`docs/`](docs/):
+
+- [CONTRACTS.md](docs/CONTRACTS.md) — shared records, artifacts, errors, and fingerprints.
+- [INTEGRATION.md](docs/INTEGRATION.md) — CLI workflows, baselines, evaluation, and privacy.
+- [STYLOMETRY.md](docs/STYLOMETRY.md) — stylometry engine and artifact format.
+- [SEMANTIC.md](docs/SEMANTIC.md) — semantic engine, model manifest, and caching.
+- [CHRONOBIOLOGY.md](docs/CHRONOBIOLOGY.md) — temporal features, fitting, and scoring.
+
 ## Data ingestion
 
 `ingest_chat_logs(paths, config=...)` accepts UTF-8 JSON (a list of records, a
@@ -91,7 +101,7 @@ manual network-capable helper.
 
 The normalized-stream-only semantic engine, local ONNX model manifest format,
 device selection, cache behavior, external-provider gate, and stable failure
-codes are documented in [SEMANTIC.md](SEMANTIC.md). NumPy is the only required
+codes are documented in [SEMANTIC.md](docs/SEMANTIC.md). NumPy is the only required
 runtime dependency; ONNX Runtime CPU or GPU may be installed through the
 corresponding optional dependency extra. Models are never downloaded at
 runtime.
@@ -99,7 +109,7 @@ runtime.
 ## Integration CLI
 
 The `authorship-attribution` commands provide `ingest`, `compare`,
-`build-baseline`, and `evaluate` workflows. See [INTEGRATION.md](INTEGRATION.md)
+`build-baseline`, and `evaluate` workflows. See [INTEGRATION.md](docs/INTEGRATION.md)
 for baseline refresh cadence, evaluation threshold selection, timeout and
 partial-failure behavior, privacy, and limits on use. Comparisons are
 moderator decision support only and require human review.
